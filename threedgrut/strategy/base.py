@@ -13,11 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Callable, Optional, Union
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 from threedgrut.model.model import MixtureOfGaussians
+from threedgrut.utils.logger import logger
 
 
 class BaseStrategy:
@@ -25,6 +29,36 @@ class BaseStrategy:
         self.conf = config
         self.model = model
         self._suspended = False
+
+        # Load test poses for custom plane interpolation (Cách A)
+        self.test_cameras = []
+        try:
+            import pandas as pd
+            csv_path = os.path.join(self.conf.path, "test", "test_poses.csv")
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                for idx, row in df.iterrows():
+                    qw, qx, qy, qz = row['qw'], row['qx'], row['qy'], row['qz']
+                    tx, ty, tz = row['tx'], row['ty'], row['tz']
+                    fx, fy = row['fx'], row['fy']
+                    cx, cy = row['cx'], row['cy']
+                    width, height = int(row['width']), int(row['height'])
+                    
+                    R = self._qvec2rotmat([qw, qx, qy, qz])
+                    W2C = np.eye(4, dtype=np.float32)
+                    W2C[:3, :3] = R[:3, :3]
+                    W2C[:3, 3] = [tx, ty, tz]
+                    
+                    self.test_cameras.append({
+                        "W2C": torch.tensor(W2C, dtype=torch.float32, device=self.model.device),
+                        "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                        "width": width, "height": height
+                    })
+                logger.info(f"✨ [BaseStrategy] Loaded {len(self.test_cameras)} test cameras for custom plane interpolation (Cách A).")
+            else:
+                logger.warning(f"⚠️ [BaseStrategy] test_poses.csv not found at {csv_path}. Custom test-pose densification is disabled.")
+        except Exception as e:
+            logger.warning(f"⚠️ [BaseStrategy] Failed to load test poses: {e}")
 
     def suspend(self) -> None:
         """Suspend the strategy, causing all training callbacks to no-op.
@@ -105,3 +139,439 @@ class BaseStrategy:
                     self.model.optimizer.param_groups[i]["params"] = [p_new]
                     self.model.optimizer.state[p_new] = p_state
                     setattr(self.model, name, p_new)
+
+    def _qvec2rotmat(self, qvec):
+        return np.array([
+            [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
+             2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
+             2 * qvec[1] * qvec[3] + 2 * qvec[0] * qvec[2],
+             0.0],
+            [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
+             1 - 2 * qvec[1]**2 - 2 * qvec[3]**2,
+             2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1],
+             0.0],
+            [2 * qvec[1] * qvec[3] - 2 * qvec[0] * qvec[2],
+             2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
+             1 - 2 * qvec[1]**2 - 2 * qvec[2]**2,
+             0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ])
+
+    def _find_sparse_rays_from_camera(self, camera, points_3d, grid_res=16, rays_per_cam=5):
+        W2C = camera["W2C"]
+        R = W2C[:3, :3]
+        T = W2C[:3, 3]
+        fx, fy = camera["fx"], camera["fy"]
+        cx, cy = camera["cx"], camera["cy"]
+        W, H = camera["width"], camera["height"]
+        
+        pts_cam = torch.matmul(points_3d, R.T) + T
+        z = pts_cam[:, 2]
+        
+        valid_mask = z > 0.1
+        if valid_mask.sum() == 0:
+            return torch.empty((0, 3), device=points_3d.device), torch.empty((0, 3), device=points_3d.device)
+            
+        pts_cam_valid = pts_cam[valid_mask]
+        z_valid = z[valid_mask]
+        
+        u = (fx * pts_cam_valid[:, 0] / z_valid + cx)
+        v = (fy * pts_cam_valid[:, 1] / z_valid + cy)
+        
+        in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        if in_bounds.sum() == 0:
+            return torch.empty((0, 3), device=points_3d.device), torch.empty((0, 3), device=points_3d.device)
+            
+        u_in = u[in_bounds]
+        v_in = v[in_bounds]
+        
+        grid_w = W / grid_res
+        grid_h = H / grid_res
+        
+        grid_x = (u_in / grid_w).long().clamp(0, grid_res - 1)
+        grid_y = (v_in / grid_h).long().clamp(0, grid_res - 1)
+        
+        grid_counts = torch.zeros((grid_res, grid_res), dtype=torch.int32, device=points_3d.device)
+        grid_indices = grid_y * grid_res + grid_x
+        grid_counts.put_(grid_indices, torch.ones_like(grid_indices, dtype=torch.int32), accumulate=True)
+        
+        has_points = grid_counts > 0
+        has_neighbor = F.max_pool2d(has_points.float().unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze() > 0
+        
+        candidate_mask = ( (grid_counts == 0) & has_neighbor ) | ( (grid_counts > 0) & (grid_counts <= 5) )
+        
+        candidates = torch.nonzero(candidate_mask)
+        if candidates.shape[0] == 0:
+            min_val = grid_counts[grid_counts > 0].min() if (grid_counts > 0).sum() > 0 else 0
+            candidate_mask = (grid_counts == min_val)
+            candidates = torch.nonzero(candidate_mask)
+            
+        if candidates.shape[0] == 0:
+            return torch.empty((0, 3), device=points_3d.device), torch.empty((0, 3), device=points_3d.device)
+            
+        counts_at_candidates = grid_counts[candidates[:, 0], candidates[:, 1]]
+        _, sorted_indices = torch.sort(counts_at_candidates)
+        candidates = candidates[sorted_indices]
+        
+        selected_candidates = candidates[:rays_per_cam]
+        
+        u_centers = (selected_candidates[:, 1].float() + 0.5) * grid_w
+        v_centers = (selected_candidates[:, 0].float() + 0.5) * grid_h
+        
+        d_cam = torch.stack([
+            (u_centers - cx) / fx,
+            (v_centers - cy) / fy,
+            torch.ones_like(u_centers)
+        ], dim=-1)
+        d_cam = F.normalize(d_cam, p=2, dim=-1)
+        
+        R_T = R.T
+        o_world = -torch.matmul(T, R)
+        rays_o = o_world.unsqueeze(0).repeat(d_cam.shape[0], 1)
+        rays_d = torch.matmul(d_cam, R_T.T)
+        
+        return rays_o, rays_d
+
+    def _plane_fitting_and_ray_intersection(self, rays_o, rays_d, points_3d, k_neighbors=15, max_dist=0.3):
+        if rays_o.shape[0] == 0:
+            return torch.empty((0, 3), device=points_3d.device)
+            
+        M = rays_o.shape[0]
+        new_points = []
+        
+        for i in range(M):
+            o = rays_o[i]
+            d = rays_d[i]
+            
+            v = points_3d - o
+            cross_prod = torch.cross(v, d.expand_as(v), dim=-1)
+            dists = torch.norm(cross_prod, dim=-1)
+            
+            proj = torch.sum(v * d, dim=-1)
+            valid_mask = (dists < max_dist) & (proj > 0)
+            
+            if valid_mask.sum() < k_neighbors:
+                continue
+                
+            valid_points = points_3d[valid_mask]
+            valid_dists = dists[valid_mask]
+            
+            _, indices = torch.topk(valid_dists, k=k_neighbors, largest=False)
+            pts_neighborhood = valid_points[indices]
+            
+            centroid = torch.mean(pts_neighborhood, dim=0)
+            pts_centered = pts_neighborhood - centroid
+            
+            try:
+                _, _, V = torch.linalg.svd(pts_centered)
+                normal = V[-1, :]
+                
+                denom = torch.dot(normal, d)
+                if torch.abs(denom) < 1e-6:
+                    continue
+                    
+                t = torch.dot(normal, centroid - o) / denom
+                if t < 0:
+                    continue
+                    
+                p_new = o + t * d
+                new_points.append(p_new)
+            except Exception:
+                continue
+                
+        if len(new_points) > 0:
+            return torch.stack(new_points, dim=0)
+        return torch.empty((0, 3), device=points_3d.device)
+
+    def _edge_guided_3d_interpolation(self, points_3d, gpu_batch, edge_threshold=0.1, n_interpolate=3):
+        if gpu_batch.rgb_gt is None:
+            return torch.empty((0, 3), device=points_3d.device)
+            
+        rgb_gt = gpu_batch.rgb_gt
+        B, H, W, C = rgb_gt.shape
+        
+        images = rgb_gt.permute(0, 3, 1, 2)
+        
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=points_3d.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=points_3d.device).view(1, 1, 3, 3)
+        
+        gray_imgs = 0.299 * images[:, 0] + 0.587 * images[:, 1] + 0.114 * images[:, 2]
+        gray_imgs = gray_imgs.unsqueeze(1)
+        
+        grad_x = F.conv2d(gray_imgs, sobel_x, padding=1)
+        grad_y = F.conv2d(gray_imgs, sobel_y, padding=1)
+        edges = torch.sqrt(grad_x**2 + grad_y**2).squeeze(1)
+        
+        if gpu_batch.intrinsics is not None:
+            fx, fy, cx, cy = gpu_batch.intrinsics
+        else:
+            params = gpu_batch.intrinsics_OpenCVPinholeCameraModelParameters
+            if params is not None:
+                fx, fy = params["focal_length"]
+                cx, cy = params["principal_point"]
+            else:
+                return torch.empty((0, 3), device=points_3d.device)
+                
+        new_points = []
+        
+        for i in range(B):
+            edge_map = edges[i]
+            c2w = gpu_batch.T_to_world[i]
+            w2c = torch.inverse(c2w)
+            
+            R = w2c[:3, :3]
+            T = w2c[:3, 3]
+            
+            pts_cam = torch.matmul(points_3d, R.T) + T
+            z = pts_cam[:, 2]
+            valid_z = z > 0.1
+            
+            u = (fx * pts_cam[:, 0] / z + cx).long()
+            v = (fy * pts_cam[:, 1] / z + cy).long()
+            
+            valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H) & valid_z
+            
+            edge_values = torch.zeros(points_3d.shape[0], device=points_3d.device)
+            edge_values[valid_uv] = edge_map[v[valid_uv], u[valid_uv]]
+            
+            edge_pts_mask = edge_values > edge_threshold
+            if edge_pts_mask.sum() < 2:
+                continue
+                
+            edge_points_3d = points_3d[edge_pts_mask]
+            
+            dists = torch.cdist(edge_points_3d, edge_points_3d)
+            
+            pairs = torch.nonzero((dists > 0.05) & (dists < 0.25))
+            pairs = pairs[pairs[:, 0] < pairs[:, 1]]
+            
+            num_pairs = min(pairs.shape[0], 50)
+            if num_pairs > 0:
+                selected_pairs = pairs[torch.randperm(pairs.shape[0])[:num_pairs]]
+                for pair_idx in range(num_pairs):
+                    idx1, idx2 = selected_pairs[pair_idx]
+                    pt1 = edge_points_3d[idx1]
+                    pt2 = edge_points_3d[idx2]
+                    
+                    for step in range(1, n_interpolate + 1):
+                        alpha = step / (n_interpolate + 1)
+                        p_interp = (1 - alpha) * pt1 + alpha * pt2
+                        new_points.append(p_interp)
+                        
+        if len(new_points) > 0:
+            return torch.stack(new_points, dim=0)
+        return torch.empty((0, 3), device=points_3d.device)
+
+    def _find_neighbor_train_cameras(self, test_camera, train_dataset, k_neighbors=1):
+        c2w_test = torch.inverse(test_camera["W2C"]).cpu().numpy()
+        pos_test = c2w_test[:3, 3]
+        dir_test = c2w_test[:3, 2]
+        
+        train_poses = train_dataset.get_poses()
+        N_train = train_poses.shape[0]
+        
+        dists = []
+        for idx in range(N_train):
+            c2w_train = train_poses[idx]
+            pos_train = c2w_train[:3, 3]
+            dir_train = c2w_train[:3, 2]
+            
+            pos_dist = np.linalg.norm(pos_test - pos_train)
+            rot_dist = 1.0 - np.dot(dir_test, dir_train)
+            
+            total_dist = pos_dist + 0.5 * rot_dist
+            dists.append((total_dist, idx))
+            
+        dists.sort(key=lambda x: x[0])
+        neighbors = [idx for _, idx in dists[:k_neighbors]]
+        return neighbors
+
+    def _project_point_to_camera_color(self, point_3d, camera_data, rgb_img):
+        W2C = camera_data["W2C"]
+        R = W2C[:3, :3]
+        T = W2C[:3, 3]
+        fx, fy = camera_data["fx"], camera_data["fy"]
+        cx, cy = camera_data["cx"], camera_data["cy"]
+        W, H = camera_data["width"], camera_data["height"]
+        
+        pt_cam = torch.matmul(R, point_3d) + T
+        z = pt_cam[2]
+        if z <= 0.1:
+            return None
+            
+        u = int(fx * pt_cam[0] / z + cx)
+        v = int(fy * pt_cam[1] / z + cy)
+        
+        if 0 <= u < W and 0 <= v < H:
+            color = rgb_img[v, u]
+            return color
+        return None
+
+    def custom_bts_densification(self, train_dataset, batch):
+        points_3d = self.model.get_positions()
+        new_pts_list = []
+        new_colors_list = []
+        
+        # 1. CÁCH A: Phóng tia từ camera train hiện tại
+        if batch.T_to_world is not None:
+            c2w = batch.T_to_world[0]
+            w2c = torch.inverse(c2w)
+            
+            if batch.intrinsics is not None:
+                fx, fy, cx, cy = batch.intrinsics
+            else:
+                params = batch.intrinsics_OpenCVPinholeCameraModelParameters
+                if params is not None:
+                    fx, fy = params["focal_length"]
+                    cx, cy = params["principal_point"]
+                else:
+                    fx, fy, cx, cy = None, None, None, None
+            
+            if fx is not None:
+                width, height = batch.rgb_gt.shape[2] if batch.rgb_gt is not None else 1000, batch.rgb_gt.shape[1] if batch.rgb_gt is not None else 1000
+                train_camera = {
+                    "W2C": w2c, "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                    "width": width, "height": height
+                }
+                
+                rays_o_train, rays_d_train = self._find_sparse_rays_from_camera(train_camera, points_3d, grid_res=16, rays_per_cam=10)
+                new_pts_a_train = self._plane_fitting_and_ray_intersection(rays_o_train, rays_d_train, points_3d, k_neighbors=15, max_dist=0.3)
+                if new_pts_a_train.shape[0] > 0:
+                    new_pts_list.append(new_pts_a_train)
+                    train_rgb = batch.rgb_gt[0] if batch.rgb_gt is not None else None
+                    train_colors = []
+                    for pt in new_pts_a_train:
+                        color = self._project_point_to_camera_color(pt, train_camera, train_rgb) if train_rgb is not None else None
+                        if color is None:
+                            color = torch.tensor([float('nan'), float('nan'), float('nan')], device=points_3d.device)
+                        train_colors.append(color)
+                    new_colors_list.append(torch.stack(train_colors, dim=0))
+                    logger.info(f"✨ [Cách A - Train] Added {new_pts_a_train.shape[0]} custom plane points.")
+        
+        # 2. CÁCH A: Phóng tia từ các camera test thưa nhất
+        if len(self.test_cameras) > 0 and train_dataset is not None:
+            test_rays_o_list = []
+            test_rays_d_list = []
+            test_cameras_used = []
+            
+            import random
+            selected_test_cams = random.sample(self.test_cameras, min(15, len(self.test_cameras)))
+            
+            for cam in selected_test_cams:
+                rays_o_test, rays_d_test = self._find_sparse_rays_from_camera(cam, points_3d, grid_res=16, rays_per_cam=20)
+                if rays_o_test.shape[0] > 0:
+                    test_rays_o_list.append(rays_o_test)
+                    test_rays_d_list.append(rays_d_test)
+                    test_cameras_used.extend([cam] * rays_o_test.shape[0])
+                    
+            if len(test_rays_o_list) > 0:
+                all_test_rays_o = torch.cat(test_rays_o_list, dim=0)
+                all_test_rays_d = torch.cat(test_rays_d_list, dim=0)
+                
+                new_pts_a_test = self._plane_fitting_and_ray_intersection(all_test_rays_o, all_test_rays_d, points_3d, k_neighbors=15, max_dist=0.3)
+                if new_pts_a_test.shape[0] > 0:
+                    new_pts_list.append(new_pts_a_test)
+                    
+                    test_colors = []
+                    for idx, pt in enumerate(new_pts_a_test):
+                        cam_test = test_cameras_used[idx]
+                        neighbor_idxs = self._find_neighbor_train_cameras(cam_test, train_dataset, k_neighbors=1)
+                        if len(neighbor_idxs) > 0:
+                            neighbor_idx = neighbor_idxs[0]
+                            try:
+                                train_data = train_dataset[neighbor_idx]
+                                image_data = train_data["data"][0]
+                                rgb_img = image_data.float().to(self.model.device) / 255.0
+                                
+                                c2w_neighbor = train_data["pose"][0]
+                                w2c_neighbor = torch.inverse(c2w_neighbor)
+                                fx_n, fy_n, cx_n, cy_n = train_data["intr"]
+                                cam_neighbor = {
+                                    "W2C": w2c_neighbor, "fx": fx_n, "fy": fy_n, "cx": cx_n, "cy": cy_n,
+                                    "width": rgb_img.shape[1], "height": rgb_img.shape[0]
+                                }
+                                
+                                color = self._project_point_to_camera_color(pt, cam_neighbor, rgb_img)
+                            except Exception:
+                                color = None
+                        else:
+                            color = None
+                            
+                        if color is None:
+                            color = torch.tensor([float('nan'), float('nan'), float('nan')], device=points_3d.device)
+                        test_colors.append(color)
+                        
+                    new_colors_list.append(torch.stack(test_colors, dim=0))
+                    logger.info(f"✨ [Cách A - Test] Added {new_pts_a_test.shape[0]} custom plane points from Test viewpoints.")
+        
+        # 3. CÁCH B: Bổ sung góc/cạnh dọc theo biên dạng 3D
+        new_pts_b = self._edge_guided_3d_interpolation(points_3d, batch, edge_threshold=0.1, n_interpolate=3)
+        if new_pts_b.shape[0] > 0:
+            new_pts_list.append(new_pts_b)
+            train_rgb = batch.rgb_gt[0] if batch.rgb_gt is not None else None
+            b_colors = []
+            for pt in new_pts_b:
+                color = self._project_point_to_camera_color(pt, train_camera, train_rgb) if (train_rgb is not None and 'train_camera' in locals()) else None
+                if color is None:
+                    color = torch.tensor([float('nan'), float('nan'), float('nan')], device=points_3d.device)
+                b_colors.append(color)
+            new_colors_list.append(torch.stack(b_colors, dim=0))
+            logger.info(f"✨ [Cách B] Added {new_pts_b.shape[0]} custom edge-guided points.")
+            
+        if len(new_pts_list) > 0:
+            added_points = torch.cat(new_pts_list, dim=0)
+            added_colors = torch.cat(new_colors_list, dim=0)
+            if added_points.shape[0] > 0:
+                self.add_custom_points(added_points, added_colors)
+
+    def add_custom_points(self, new_positions, new_colors=None):
+        num_new = new_positions.shape[0]
+        
+        mean_scale = self.model.scale.mean(dim=0, keepdim=True).repeat(num_new, 1)
+        mean_rotation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.model.device).repeat(num_new, 1)
+        mean_density = self.model.density.mean(dim=0, keepdim=True).repeat(num_new, 1)
+        
+        if self.model.feature_type.name == "SH":
+            if new_colors is not None:
+                new_albedo = (new_colors - 0.5) / 0.28209479177387814
+                mean_albedo = self.model.features_albedo.mean(dim=0, keepdim=True).repeat(num_new, 1)
+                valid_color_mask = ~torch.isnan(new_colors).any(dim=-1)
+                mean_albedo[valid_color_mask] = new_albedo[valid_color_mask]
+            else:
+                mean_albedo = self.model.features_albedo.mean(dim=0, keepdim=True).repeat(num_new, 1)
+            mean_specular = self.model.features_specular.mean(dim=0, keepdim=True).repeat(num_new, 1)
+        else:
+            if new_colors is not None:
+                mean_features = self.model.features.mean(dim=0, keepdim=True).repeat(num_new, 1)
+                valid_color_mask = ~torch.isnan(new_colors).any(dim=-1)
+                padded_colors = torch.zeros((num_new, mean_features.shape[1]), device=self.model.device)
+                padded_colors[:, :3] = new_colors
+                mean_features[valid_color_mask] = padded_colors[valid_color_mask]
+            else:
+                mean_features = self.model.features.mean(dim=0, keepdim=True).repeat(num_new, 1)
+
+        def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
+            if name == "positions":
+                p_new = torch.cat([param, new_positions])
+            elif name == "scale":
+                p_new = torch.cat([param, mean_scale])
+            elif name == "rotation":
+                p_new = torch.cat([param, mean_rotation])
+            elif name == "density":
+                p_new = torch.cat([param, mean_density])
+            elif name == "features_albedo":
+                p_new = torch.cat([param, mean_albedo])
+            elif name == "features_specular":
+                p_new = torch.cat([param, mean_specular])
+            elif name == "features":
+                p_new = torch.cat([param, mean_features])
+            else:
+                p_new = param
+            return torch.nn.Parameter(p_new, requires_grad=param.requires_grad)
+
+        def update_optimizer_fn(key: str, v: torch.Tensor) -> torch.Tensor:
+            v_new = torch.zeros((num_new, *v.shape[1:]), device=v.device)
+            return torch.cat([v, v_new])
+
+        self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
+        self.reset_densification_buffers()

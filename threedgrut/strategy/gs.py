@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.strategy.base import BaseStrategy
@@ -38,6 +41,36 @@ class GSStrategy(BaseStrategy):
         # Accumulation of the norms of the positions gradients
         self.densify_grad_norm_accum = torch.empty([0, 1])
         self.densify_grad_norm_denom = torch.empty([0, 1])
+
+        # Load test poses for custom plane interpolation (Cách A)
+        self.test_cameras = []
+        try:
+            import pandas as pd
+            csv_path = os.path.join(self.conf.path, "test", "test_poses.csv")
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                for idx, row in df.iterrows():
+                    qw, qx, qy, qz = row['qw'], row['qx'], row['qy'], row['qz']
+                    tx, ty, tz = row['tx'], row['ty'], row['tz']
+                    fx, fy = row['fx'], row['fy']
+                    cx, cy = row['cx'], row['cy']
+                    width, height = int(row['width']), int(row['height'])
+                    
+                    R = self._qvec2rotmat([qw, qx, qy, qz])
+                    W2C = np.eye(4, dtype=np.float32)
+                    W2C[:3, :3] = R[:3, :3]
+                    W2C[:3, 3] = [tx, ty, tz]
+                    
+                    self.test_cameras.append({
+                        "W2C": torch.tensor(W2C, dtype=torch.float32, device=self.model.device),
+                        "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                        "width": width, "height": height
+                    })
+                logger.info(f"✨ Loaded {len(self.test_cameras)} test cameras for custom plane interpolation (Cách A).")
+            else:
+                logger.warning(f"⚠️ test_poses.csv not found at {csv_path}. Custom test-pose densification is disabled.")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load test poses: {e}")
 
     def get_strategy_parameters(self) -> dict:
         params = {}
@@ -74,8 +107,14 @@ class GSStrategy(BaseStrategy):
     def _post_optimizer_step(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
         """Callback function to be executed after the optimizer step."""
         scene_updated = False
-        # Densify the Gaussians
+        
+        # Gọi bổ sung point tùy biến (Cách A & Cách B) định kỳ mỗi 1000 iterations
+        # Chỉ chạy từ iteration 500 đến 28000 (dành 2000 iter cuối để fine-tune ổn định)
+        if step >= 500 and step <= 28000 and step % 1000 == 0 and batch is not None:
+            self.custom_bts_densification(train_dataset, batch)
+            scene_updated = True
 
+        # Densify the Gaussians
         if check_step_condition(
             step,
             self.conf.strategy.densify.start_iteration,
@@ -326,3 +365,5 @@ class GSStrategy(BaseStrategy):
 
         # update the parameters and the state in the optimizers
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn, names=["density"])
+
+
