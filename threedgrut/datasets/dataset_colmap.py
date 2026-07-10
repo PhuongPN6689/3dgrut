@@ -237,6 +237,13 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             self.cam_extrinsics = read_colmap_extrinsics_text(cameras_extrinsic_file)
             self.cam_intrinsics = read_colmap_intrinsics_text(cameras_intrinsic_file)
 
+        # Keep only extrinsics for images that actually exist on disk in the split's image folder
+        image_dir = os.path.join(self.path, self.get_images_folder())
+        self.cam_extrinsics = [
+            extr for extr in self.cam_extrinsics
+            if os.path.exists(os.path.join(image_dir, extr.name))
+        ]
+
     def _camera_names_by_id(self) -> dict[int, str]:
         sorted_camera_ids = sorted(self.cam_intrinsics.keys())
         camera_id_to_idx = {camera_id: idx for idx, camera_id in enumerate(sorted_camera_ids)}

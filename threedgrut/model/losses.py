@@ -14,7 +14,12 @@
 # limitations under the License.
 
 import torch
-from fused_ssim import fused_ssim
+try:
+    from fused_ssim import fused_ssim
+except ImportError:
+    from torchmetrics.functional.image import structural_similarity_index_measure
+    def fused_ssim(img1, img2, padding="valid"):
+        return structural_similarity_index_measure(img1, img2, data_range=1.0)
 
 
 @torch.cuda.nvtx.range("l1_loss")
