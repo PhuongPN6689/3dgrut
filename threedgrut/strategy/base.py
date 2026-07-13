@@ -34,7 +34,17 @@ class BaseStrategy:
         self.test_cameras = []
         try:
             import pandas as pd
-            csv_path = os.path.join(self.conf.path, "test", "test_poses.csv")
+            parent_path = self.conf.path
+            if parent_path.rstrip("/").endswith("train"):
+                parent_path = os.path.dirname(parent_path.rstrip("/"))
+            csv_path = os.path.join(parent_path, "test", "test_poses.csv")
+            
+            # Fallback check
+            if not os.path.exists(csv_path):
+                csv_path = os.path.join(self.conf.path, "test", "test_poses.csv")
+            if not os.path.exists(csv_path):
+                csv_path = os.path.join(self.conf.path, "test_poses.csv")
+                
             if os.path.exists(csv_path):
                 df = pd.read_csv(csv_path)
                 for idx, row in df.iterrows():
@@ -339,6 +349,11 @@ class BaseStrategy:
                 
             edge_points_3d = points_3d[edge_pts_mask]
             
+            # Limit the number of edge points to prevent CUDA OOM on pairwise cdist
+            if edge_points_3d.shape[0] > 4000:
+                perm = torch.randperm(edge_points_3d.shape[0], device=edge_points_3d.device)[:4000]
+                edge_points_3d = edge_points_3d[perm]
+                
             dists = torch.cdist(edge_points_3d, edge_points_3d)
             
             # Find 3-nearest neighbors for quadratic Bezier interpolation
@@ -449,7 +464,7 @@ class BaseStrategy:
                 
                 # grid_res=32 và rays_per_cam=100 để lấy đúng 100 điểm thưa nhất
                 rays_o_train, rays_d_train = self._find_sparse_rays_from_camera(train_camera, points_3d, grid_res=32, rays_per_cam=100)
-                new_pts_a_train = self._plane_fitting_and_ray_intersection(rays_o_train, rays_d_train, points_3d, k_neighbors=15, max_dist=0.3)
+                new_pts_a_train = self._plane_fitting_and_ray_intersection(rays_o_train, rays_d_train, points_3d, k_neighbors=8, max_dist=0.6)
                 if new_pts_a_train.shape[0] > 0:
                     new_pts_list.append(new_pts_a_train)
                     train_rgb = batch.rgb_gt[0] if batch.rgb_gt is not None else None
@@ -484,7 +499,7 @@ class BaseStrategy:
                 all_test_rays_o = torch.cat(test_rays_o_list, dim=0)
                 all_test_rays_d = torch.cat(test_rays_d_list, dim=0)
                 
-                new_pts_a_test = self._plane_fitting_and_ray_intersection(all_test_rays_o, all_test_rays_d, points_3d, k_neighbors=15, max_dist=0.3)
+                new_pts_a_test = self._plane_fitting_and_ray_intersection(all_test_rays_o, all_test_rays_d, points_3d, k_neighbors=8, max_dist=0.6)
                 if new_pts_a_test.shape[0] > 0:
                     new_pts_list.append(new_pts_a_test)
                     
