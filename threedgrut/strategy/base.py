@@ -283,13 +283,12 @@ class BaseStrategy:
             return torch.stack(new_points, dim=0)
         return torch.empty((0, 3), device=points_3d.device)
 
-    def _edge_guided_3d_interpolation(self, points_3d, gpu_batch, edge_threshold=0.1, n_interpolate=3):
+    def _edge_guided_3d_interpolation(self, points_3d, gpu_batch, edge_threshold=0.1, n_interpolate=3, target_points=100):
         if gpu_batch.rgb_gt is None:
             return torch.empty((0, 3), device=points_3d.device)
             
         rgb_gt = gpu_batch.rgb_gt
         B, H, W, C = rgb_gt.shape
-        
         images = rgb_gt.permute(0, 3, 1, 2)
         
         sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=points_3d.device).view(1, 1, 3, 3)
@@ -335,31 +334,45 @@ class BaseStrategy:
             edge_values[valid_uv] = edge_map[v[valid_uv], u[valid_uv]]
             
             edge_pts_mask = edge_values > edge_threshold
-            if edge_pts_mask.sum() < 2:
+            if edge_pts_mask.sum() < 3:
                 continue
                 
             edge_points_3d = points_3d[edge_pts_mask]
             
             dists = torch.cdist(edge_points_3d, edge_points_3d)
             
-            pairs = torch.nonzero((dists > 0.05) & (dists < 0.25))
-            pairs = pairs[pairs[:, 0] < pairs[:, 1]]
+            # Find 3-nearest neighbors for quadratic Bezier interpolation
+            _, knn_indices = torch.topk(dists, k=3, largest=False)
             
-            num_pairs = min(pairs.shape[0], 50)
-            if num_pairs > 0:
-                selected_pairs = pairs[torch.randperm(pairs.shape[0])[:num_pairs]]
-                for pair_idx in range(num_pairs):
-                    idx1, idx2 = selected_pairs[pair_idx]
-                    pt1 = edge_points_3d[idx1]
-                    pt2 = edge_points_3d[idx2]
+            num_interpolated = 0
+            # Shuffle indices to distribute points randomly along edges
+            shuffled_indices = torch.randperm(edge_points_3d.shape[0])
+            for idx in shuffled_indices:
+                if num_interpolated >= target_points:
+                    break
                     
-                    for step in range(1, n_interpolate + 1):
-                        alpha = step / (n_interpolate + 1)
-                        p_interp = (1 - alpha) * pt1 + alpha * pt2
-                        new_points.append(p_interp)
+                pt1_idx = idx
+                pt2_idx = knn_indices[idx, 1]
+                pt3_idx = knn_indices[idx, 2]
+                
+                d12 = dists[pt1_idx, pt2_idx]
+                d23 = dists[pt2_idx, pt3_idx]
+                
+                # Check distance constraints to ensure we interpolate along continuous edge curves
+                if 0.05 < d12 < 0.3 and 0.05 < d23 < 0.3:
+                    P1 = edge_points_3d[pt1_idx]
+                    P2 = edge_points_3d[pt2_idx]
+                    P3 = edge_points_3d[pt3_idx]
+                    
+                    # 3D Quadratic Bezier Curve interpolation
+                    t_vals = torch.linspace(0.2, 0.8, n_interpolate, device=points_3d.device)
+                    for t in t_vals:
+                        pt_new = (1 - t)**2 * P1 + 2 * t * (1 - t) * P2 + t**2 * P3
+                        new_points.append(pt_new)
+                        num_interpolated += 1
                         
         if len(new_points) > 0:
-            return torch.stack(new_points, dim=0)
+            return torch.stack(new_points, dim=0)[:target_points]
         return torch.empty((0, 3), device=points_3d.device)
 
     def _find_neighbor_train_cameras(self, test_camera, train_dataset, k_neighbors=1):
@@ -412,7 +425,7 @@ class BaseStrategy:
         new_pts_list = []
         new_colors_list = []
         
-        # 1. CÁCH A: Phóng tia từ camera train hiện tại
+        # 1. CÁCH A: Phóng tia từ camera train hiện tại - bổ sung 100 điểm thưa nhất
         if batch.T_to_world is not None:
             c2w = batch.T_to_world[0]
             w2c = torch.inverse(c2w)
@@ -434,7 +447,8 @@ class BaseStrategy:
                     "width": width, "height": height
                 }
                 
-                rays_o_train, rays_d_train = self._find_sparse_rays_from_camera(train_camera, points_3d, grid_res=16, rays_per_cam=10)
+                # grid_res=32 và rays_per_cam=100 để lấy đúng 100 điểm thưa nhất
+                rays_o_train, rays_d_train = self._find_sparse_rays_from_camera(train_camera, points_3d, grid_res=32, rays_per_cam=100)
                 new_pts_a_train = self._plane_fitting_and_ray_intersection(rays_o_train, rays_d_train, points_3d, k_neighbors=15, max_dist=0.3)
                 if new_pts_a_train.shape[0] > 0:
                     new_pts_list.append(new_pts_a_train)
@@ -448,17 +462,19 @@ class BaseStrategy:
                     new_colors_list.append(torch.stack(train_colors, dim=0))
                     logger.info(f"✨ [Cách A - Train] Added {new_pts_a_train.shape[0]} custom plane points.")
         
-        # 2. CÁCH A: Phóng tia từ các camera test thưa nhất
+        # 2. CÁCH A: Phóng tia từ các camera test thưa nhất - bổ sung đúng 300 điểm
         if len(self.test_cameras) > 0 and train_dataset is not None:
             test_rays_o_list = []
             test_rays_d_list = []
             test_cameras_used = []
             
             import random
+            # Chọn ngẫu nhiên 15 camera test
             selected_test_cams = random.sample(self.test_cameras, min(15, len(self.test_cameras)))
             
+            # Mỗi camera test phóng 20 tia, tổng cộng tối đa 300 tia
             for cam in selected_test_cams:
-                rays_o_test, rays_d_test = self._find_sparse_rays_from_camera(cam, points_3d, grid_res=16, rays_per_cam=20)
+                rays_o_test, rays_d_test = self._find_sparse_rays_from_camera(cam, points_3d, grid_res=32, rays_per_cam=20)
                 if rays_o_test.shape[0] > 0:
                     test_rays_o_list.append(rays_o_test)
                     test_rays_d_list.append(rays_d_test)
@@ -504,8 +520,8 @@ class BaseStrategy:
                     new_colors_list.append(torch.stack(test_colors, dim=0))
                     logger.info(f"✨ [Cách A - Test] Added {new_pts_a_test.shape[0]} custom plane points from Test viewpoints.")
         
-        # 3. CÁCH B: Bổ sung góc/cạnh dọc theo biên dạng 3D
-        new_pts_b = self._edge_guided_3d_interpolation(points_3d, batch, edge_threshold=0.1, n_interpolate=3)
+        # 3. CÁCH B: Bổ sung góc/cạnh dọc theo biên dạng 3D - bổ sung đúng 100 điểm
+        new_pts_b = self._edge_guided_3d_interpolation(points_3d, batch, edge_threshold=0.1, n_interpolate=3, target_points=100)
         if new_pts_b.shape[0] > 0:
             new_pts_list.append(new_pts_b)
             train_rgb = batch.rgb_gt[0] if batch.rgb_gt is not None else None
