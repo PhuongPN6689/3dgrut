@@ -1328,8 +1328,10 @@ class Trainer3DGRUT:
     @torch.no_grad()
     def save_images_to_disk(self, step: int):
         import os
+        import shutil
         import torchvision
         import pandas as pd
+        import zipfile
         
         # 1. Tìm đường dẫn file test_poses.csv
         parent_path = self.conf.path
@@ -1349,9 +1351,25 @@ class Trainer3DGRUT:
             df = pd.read_csv(csv_path)
             image_names = df['image_name'].tolist()
             
-        output_dir = os.path.join(self.conf.out_dir, f"renders_step_{step}")
+        # 2. Xác định thư mục lưu ảnh (theo cấu trúc submission chuẩn)
+        scene_name = getattr(self.conf, "experiment_name", "scene")
+        
+        # Kiểm tra xem có đang chạy trên Kaggle không
+        if os.path.exists("/kaggle/working"):
+            submission_dir = "/kaggle/working/submission"
+            zip_path = f"/kaggle/working/submission_step_{step}.zip"
+        else:
+            submission_dir = os.path.join(self.conf.out_dir, "submission")
+            zip_path = os.path.join(self.conf.out_dir, f"submission_step_{step}.zip")
+            
+        output_dir = os.path.join(submission_dir, scene_name)
+        
+        # Dọn dẹp các ảnh cũ trong thư mục scene này trước khi ghi mới
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
         os.makedirs(output_dir, exist_ok=True)
-        logger.info(f"💾 Saving test/validation renders to disk at: {output_dir}")
+        
+        logger.info(f"💾 Saving test/validation renders to submission folder: {output_dir}")
         
         if self.feature_decoder is not None:
             self.feature_decoder.apply_ema_shadow()
@@ -1383,6 +1401,19 @@ class Trainer3DGRUT:
             self.feature_decoder.restore_ema()
             
         logger.info(f"✅ Successfully saved {len(self.val_dataloader)} images for step {step}!")
+        
+        # 3. Đóng gói zip thư mục submission lại luôn
+        logger.info(f"🤐 Packaging submission folder into zip: {zip_path}")
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+                for root, _, files in os.walk(submission_dir):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        arcname = os.path.relpath(fp, submission_dir)
+                        z.write(fp, arcname)
+            logger.info(f"🎉 Created submission zip successfully at: {zip_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to package zip: {e}")
 
     @torch.cuda.nvtx.range(f"run_validation_pass")
     @torch.no_grad()
