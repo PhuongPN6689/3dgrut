@@ -590,4 +590,5 @@ class BaseStrategy:
             return torch.cat([v, v_new])
 
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
-        self.reset_densification_buffers()
+        if hasattr(self, "reset_densification_buffers"):
+            self.reset_densification_buffers()
