@@ -1329,7 +1329,26 @@ class Trainer3DGRUT:
     def save_images_to_disk(self, step: int):
         import os
         import torchvision
+        import pandas as pd
         
+        # 1. Tìm đường dẫn file test_poses.csv
+        parent_path = self.conf.path
+        if parent_path.rstrip("/").endswith("train"):
+            parent_path = os.path.dirname(parent_path.rstrip("/"))
+        csv_path = os.path.join(parent_path, "test", "test_poses.csv")
+        
+        if not os.path.exists(csv_path):
+            csv_path = os.path.join(self.conf.path, "test", "test_poses.csv")
+        if not os.path.exists(csv_path):
+            csv_path = os.path.join(self.conf.path, "test_poses.csv")
+            
+        if not os.path.exists(csv_path):
+            logger.warning(f"⚠️ test_poses.csv not found, fallback to default names.")
+            image_names = [f"frame_{idx:04d}.png" for idx in range(len(self.val_dataloader))]
+        else:
+            df = pd.read_csv(csv_path)
+            image_names = df['image_name'].tolist()
+            
         output_dir = os.path.join(self.conf.out_dir, f"renders_step_{step}")
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"💾 Saving test/validation renders to disk at: {output_dir}")
@@ -1356,7 +1375,8 @@ class Trainer3DGRUT:
             rgb_pred = outputs["pred_features"][-1].clip(0, 1.0)
             img = rgb_pred.permute(2, 0, 1)
             
-            img_path = os.path.join(output_dir, f"frame_{val_iteration:04d}.png")
+            image_name = image_names[val_iteration] if val_iteration < len(image_names) else f"frame_{val_iteration:04d}.png"
+            img_path = os.path.join(output_dir, image_name)
             torchvision.utils.save_image(img, img_path)
             
         if self.feature_decoder is not None:
