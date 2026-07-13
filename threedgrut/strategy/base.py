@@ -102,6 +102,7 @@ class BaseStrategy:
 
     def post_optimizer_step(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
         """Callback function to be executed after the optimizer step."""
+        self.current_step = step
         if self._suspended:
             return False
         return self._post_optimizer_step(step, scene_extent, train_dataset, batch, writer)
@@ -167,7 +168,7 @@ class BaseStrategy:
             [0.0, 0.0, 0.0, 1.0]
         ])
 
-    def _find_sparse_rays_from_camera(self, camera, points_3d, grid_res=16, rays_per_cam=5):
+    def _find_sparse_rays_from_camera(self, camera, points_3d, grid_res=32, rays_per_cam=50, target_density=80, top_percentage=0.3):
         W2C = camera["W2C"]
         R = W2C[:3, :3]
         T = W2C[:3, 3]
@@ -205,25 +206,33 @@ class BaseStrategy:
         grid_indices = grid_y * grid_res + grid_x
         grid_counts.put_(grid_indices, torch.ones_like(grid_indices, dtype=torch.int32), accumulate=True)
         
-        has_points = grid_counts > 0
-        has_neighbor = F.max_pool2d(has_points.float().unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze() > 0
+        # 1. Xác định ô hợp lệ: Bản thân >= target_density hoặc lân cận >= target_density
+        has_high_density = (grid_counts >= target_density).float().unsqueeze(0).unsqueeze(0)
+        neighbor_high_density = F.max_pool2d(has_high_density, kernel_size=3, stride=1, padding=1).squeeze() > 0
         
-        candidate_mask = ( (grid_counts == 0) & has_neighbor ) | ( (grid_counts > 0) & (grid_counts <= 5) )
-        
-        candidates = torch.nonzero(candidate_mask)
-        if candidates.shape[0] == 0:
-            min_val = grid_counts[grid_counts > 0].min() if (grid_counts > 0).sum() > 0 else 0
-            candidate_mask = (grid_counts == min_val)
-            candidates = torch.nonzero(candidate_mask)
+        # Lấy các ô hợp lệ
+        valid_candidates = torch.nonzero(neighbor_high_density)
+        if valid_candidates.shape[0] == 0:
+            # Fallback nếu không có ô nào đạt target_density, ta lấy các ô có điểm
+            valid_candidates = torch.nonzero(grid_counts > 0)
             
-        if candidates.shape[0] == 0:
+        if valid_candidates.shape[0] == 0:
             return torch.empty((0, 3), device=points_3d.device), torch.empty((0, 3), device=points_3d.device)
             
-        counts_at_candidates = grid_counts[candidates[:, 0], candidates[:, 1]]
-        _, sorted_indices = torch.sort(counts_at_candidates)
-        candidates = candidates[sorted_indices]
+        # Lấy số lượng điểm tại các ô hợp lệ
+        counts_at_candidates = grid_counts[valid_candidates[:, 0], valid_candidates[:, 1]]
         
-        selected_candidates = candidates[:rays_per_cam]
+        # 2. Lấy top 30% thưa nhất trong các ô hợp lệ
+        sorted_indices = torch.argsort(counts_at_candidates)
+        valid_candidates = valid_candidates[sorted_indices]
+        counts_at_candidates = counts_at_candidates[sorted_indices]
+        
+        num_candidates = valid_candidates.shape[0]
+        cutoff_idx = max(1, int(num_candidates * top_percentage))
+        top_candidates = valid_candidates[:cutoff_idx]
+        
+        # 3. Chọn ra tối đa rays_per_cam (50 ô) từ top candidates
+        selected_candidates = top_candidates[:rays_per_cam]
         
         u_centers = (selected_candidates[:, 1].float() + 0.5) * grid_w
         v_centers = (selected_candidates[:, 0].float() + 0.5) * grid_h
@@ -293,7 +302,7 @@ class BaseStrategy:
             return torch.stack(new_points, dim=0)
         return torch.empty((0, 3), device=points_3d.device)
 
-    def _edge_guided_3d_interpolation(self, points_3d, gpu_batch, edge_threshold=0.1, n_interpolate=3, target_points=100):
+    def _edge_guided_3d_interpolation(self, points_3d, gpu_batch, edge_threshold=0.1, n_interpolate=4, target_points=100):
         if gpu_batch.rgb_gt is None:
             return torch.empty((0, 3), device=points_3d.device)
             
@@ -323,6 +332,20 @@ class BaseStrategy:
                 
         new_points = []
         
+        step = getattr(self, "current_step", 0)
+        # Luân phiên kích thước lưới và góc tọa độ theo step
+        if (step // 1000) % 2 == 0:
+            grid_res = 16
+            x_min, y_min = 0.0, 0.0
+        else:
+            grid_res = 15
+            W_grid_temp = W / 15.0
+            H_grid_temp = H / 15.0
+            x_min, y_min = -W_grid_temp / 2.0, -H_grid_temp / 2.0
+            
+        W_grid = W / float(grid_res)
+        H_grid = H / float(grid_res)
+        
         for i in range(B):
             edge_map = edges[i]
             c2w = gpu_batch.T_to_world[i]
@@ -335,56 +358,123 @@ class BaseStrategy:
             z = pts_cam[:, 2]
             valid_z = z > 0.1
             
-            u = (fx * pts_cam[:, 0] / z + cx).long()
-            v = (fy * pts_cam[:, 1] / z + cy).long()
+            u = (fx * pts_cam[:, 0] / z + cx)
+            v = (fy * pts_cam[:, 1] / z + cy)
             
             valid_uv = (u >= 0) & (u < W) & (v >= 0) & (v < H) & valid_z
-            
+            if valid_uv.sum() < 5:
+                continue
+                
             edge_values = torch.zeros(points_3d.shape[0], device=points_3d.device)
-            edge_values[valid_uv] = edge_map[v[valid_uv], u[valid_uv]]
+            edge_values[valid_uv] = edge_map[v[valid_uv].long(), u[valid_uv].long()]
             
             edge_pts_mask = edge_values > edge_threshold
-            if edge_pts_mask.sum() < 3:
+            if edge_pts_mask.sum() < 5:
                 continue
                 
             edge_points_3d = points_3d[edge_pts_mask]
+            edge_uv = torch.stack([u[edge_pts_mask], v[edge_pts_mask]], dim=-1)
             
-            # Limit the number of edge points to prevent CUDA OOM on pairwise cdist
+            # GIỮ LẠI FALLBACK DỰ PHÒNG MAX 4000: giới hạn số lượng điểm tránh cdist khổng lồ
             if edge_points_3d.shape[0] > 4000:
-                perm = torch.randperm(edge_points_3d.shape[0], device=edge_points_3d.device)[:4000]
+                perm = torch.randperm(edge_points_3d.shape[0], device=points_3d.device)[:4000]
                 edge_points_3d = edge_points_3d[perm]
+                edge_uv = edge_uv[perm]
                 
-            dists = torch.cdist(edge_points_3d, edge_points_3d)
+            # Chia điểm biên vào các ô lưới
+            u_shifted = edge_uv[:, 0] - x_min
+            v_shifted = edge_uv[:, 1] - y_min
             
-            # Find 3-nearest neighbors for quadratic Bezier interpolation
-            _, knn_indices = torch.topk(dists, k=3, largest=False)
+            grid_x = (u_shifted / W_grid).long().clamp(0, grid_res - 1)
+            grid_y = (v_shifted / H_grid).long().clamp(0, grid_res - 1)
             
-            num_interpolated = 0
-            # Shuffle indices to distribute points randomly along edges
-            shuffled_indices = torch.randperm(edge_points_3d.shape[0])
-            for idx in shuffled_indices:
-                if num_interpolated >= target_points:
+            cell_indices = grid_y * grid_res + grid_x
+            
+            candidates = []
+            candidate_lengths = []
+            
+            unique_cells = torch.unique(cell_indices)
+            unique_cells = unique_cells[torch.randperm(unique_cells.shape[0])]
+            
+            for cell_id in unique_cells:
+                if len(candidates) >= 500:
                     break
                     
-                pt1_idx = idx
-                pt2_idx = knn_indices[idx, 1]
-                pt3_idx = knn_indices[idx, 2]
-                
-                d12 = dists[pt1_idx, pt2_idx]
-                d23 = dists[pt2_idx, pt3_idx]
-                
-                # Check distance constraints to ensure we interpolate along continuous edge curves
-                if 0.05 < d12 < 0.3 and 0.05 < d23 < 0.3:
-                    P1 = edge_points_3d[pt1_idx]
-                    P2 = edge_points_3d[pt2_idx]
-                    P3 = edge_points_3d[pt3_idx]
+                cell_mask = cell_indices == cell_id
+                if cell_mask.sum() < 5:
+                    continue
                     
-                    # 3D Quadratic Bezier Curve interpolation
-                    t_vals = torch.linspace(0.2, 0.8, n_interpolate, device=points_3d.device)
-                    for t in t_vals:
-                        pt_new = (1 - t)**2 * P1 + 2 * t * (1 - t) * P2 + t**2 * P3
-                        new_points.append(pt_new)
-                        num_interpolated += 1
+                cell_pts = edge_points_3d[cell_mask]
+                cell_uv_pts = edge_uv[cell_mask]
+                
+                # Tính cdist trong nội bộ ô lưới (cực kỳ nhỏ và an toàn)
+                dists_cell = torch.cdist(cell_pts, cell_pts)
+                
+                num_cell_pts = cell_pts.shape[0]
+                sample_pts = torch.randperm(num_cell_pts)[:min(15, num_cell_pts)]
+                
+                for idx in sample_pts:
+                    if len(candidates) >= 500:
+                        break
+                        
+                    _, knn_idx = torch.topk(dists_cell[idx], k=5, largest=False)
+                    pts_5 = cell_pts[knn_idx]
+                    uv_5 = cell_uv_pts[knn_idx]
+                    
+                    # Kiểm tra khoảng cách lân cận hợp lý
+                    valid_dist = True
+                    for j in range(4):
+                        d_j = dists_cell[knn_idx[j], knn_idx[j+1]]
+                        if not (0.02 < d_j < 0.5):
+                            valid_dist = False
+                            break
+                            
+                    if valid_dist:
+                        # 1. Sắp xếp 5 điểm theo Nearest Neighbor (chống xoắn Bezier bậc 4)
+                        sorted_idx = [0]
+                        remaining = list(range(1, 5))
+                        current = 0
+                        for _ in range(4):
+                            min_d = float('inf')
+                            next_idx = -1
+                            for r in remaining:
+                                d_r = torch.norm(pts_5[current] - pts_5[r])
+                                if d_r < min_d:
+                                    min_d = d_r
+                                    next_idx = r
+                            sorted_idx.append(next_idx)
+                            remaining.remove(next_idx)
+                            current = next_idx
+                            
+                        pts_5_sorted = pts_5[sorted_idx]
+                        uv_5_sorted = uv_5[sorted_idx]
+                        
+                        # 2. Tính chiều dài đường đi 2D nối tiếp của bộ 5 điểm
+                        path_len_2d = 0.0
+                        for j in range(4):
+                            path_len_2d += torch.norm(uv_5_sorted[j+1] - uv_5_sorted[j])
+                            
+                        candidates.append(pts_5_sorted)
+                        candidate_lengths.append(path_len_2d)
+                        
+            if len(candidates) == 0:
+                continue
+                
+            # Lọc lấy top 25 bộ thưa nhất (Lớn nhất)
+            candidate_lengths_tensor = torch.stack(candidate_lengths) if isinstance(candidate_lengths[0], torch.Tensor) else torch.tensor(candidate_lengths, device=points_3d.device)
+            num_to_select = min(25, len(candidates))
+            _, top_indices = torch.topk(candidate_lengths_tensor, k=num_to_select, largest=True)
+            
+            # Nội suy Bezier bậc 4 cho top 25 bộ thưa nhất
+            for idx in top_indices:
+                pts_5 = candidates[idx]
+                P1, P2, P3, P4, P5 = pts_5[0], pts_5[1], pts_5[2], pts_5[3], pts_5[4]
+                
+                # Bổ sung đúng 4 điểm tại các vị trí t = 0.125, 0.375, 0.625, 0.875
+                t_vals = torch.tensor([0.125, 0.375, 0.625, 0.875], device=points_3d.device)
+                for t in t_vals:
+                    pt_new = (1 - t)**4 * P1 + 4 * t * (1 - t)**3 * P2 + 6 * t**2 * (1 - t)**2 * P3 + 4 * t**3 * (1 - t) * P4 + t**4 * P5
+                    new_points.append(pt_new)
                         
         if len(new_points) > 0:
             return torch.stack(new_points, dim=0)[:target_points]
@@ -440,7 +530,7 @@ class BaseStrategy:
         new_pts_list = []
         new_colors_list = []
         
-        # 1. CÁCH A: Phóng tia từ camera train hiện tại - bổ sung 100 điểm thưa nhất
+        # 1. CÁCH A: Phóng tia từ camera train hiện tại - bổ sung 50 điểm thưa nhất hợp lệ
         if batch.T_to_world is not None:
             c2w = batch.T_to_world[0]
             w2c = torch.inverse(c2w)
@@ -462,8 +552,8 @@ class BaseStrategy:
                     "width": width, "height": height
                 }
                 
-                # grid_res=32 và rays_per_cam=100 để lấy đúng 100 điểm thưa nhất
-                rays_o_train, rays_d_train = self._find_sparse_rays_from_camera(train_camera, points_3d, grid_res=32, rays_per_cam=100)
+                # grid_res=32, target_density=80, top_percentage=0.3, rays_per_cam=50
+                rays_o_train, rays_d_train = self._find_sparse_rays_from_camera(train_camera, points_3d, grid_res=32, rays_per_cam=50, target_density=80, top_percentage=0.3)
                 new_pts_a_train = self._plane_fitting_and_ray_intersection(rays_o_train, rays_d_train, points_3d, k_neighbors=8, max_dist=0.6)
                 if new_pts_a_train.shape[0] > 0:
                     new_pts_list.append(new_pts_a_train)
@@ -477,19 +567,17 @@ class BaseStrategy:
                     new_colors_list.append(torch.stack(train_colors, dim=0))
                     logger.info(f"✨ [Cách A - Train] Added {new_pts_a_train.shape[0]} custom plane points.")
         
-        # 2. CÁCH A: Phóng tia từ các camera test thưa nhất - bổ sung đúng 300 điểm
+        # 2. CÁCH A: Phóng tia từ toàn bộ các camera test - tổng cộng bổ sung đúng 300 điểm
         if len(self.test_cameras) > 0 and train_dataset is not None:
             test_rays_o_list = []
             test_rays_d_list = []
             test_cameras_used = []
             
-            import random
-            # Chọn ngẫu nhiên 15 camera test
-            selected_test_cams = random.sample(self.test_cameras, min(15, len(self.test_cameras)))
+            # Chia đều 300 tia cho toàn bộ các camera test để chăm sóc đồng đều mọi góc nhìn test
+            rays_per_test_cam = max(1, 300 // len(self.test_cameras))
             
-            # Mỗi camera test phóng 20 tia, tổng cộng tối đa 300 tia
-            for cam in selected_test_cams:
-                rays_o_test, rays_d_test = self._find_sparse_rays_from_camera(cam, points_3d, grid_res=32, rays_per_cam=20)
+            for cam in self.test_cameras:
+                rays_o_test, rays_d_test = self._find_sparse_rays_from_camera(cam, points_3d, grid_res=32, rays_per_cam=rays_per_test_cam, target_density=80, top_percentage=0.3)
                 if rays_o_test.shape[0] > 0:
                     test_rays_o_list.append(rays_o_test)
                     test_rays_d_list.append(rays_d_test)

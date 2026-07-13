@@ -78,8 +78,9 @@ class MCMCStrategy(BaseStrategy):
 
     def _post_optimizer_step(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
         # Gọi bổ sung point tùy biến (Cách A & Cách B) định kỳ mỗi 1000 iterations
-        # Chỉ chạy từ iteration 500 đến 28000 (dành 2000 iter cuối để fine-tune ổn định)
-        if step >= 500 and step <= 28000 and step % 1000 == 0 and batch is not None:
+        # Chỉ chạy tối đa 67% số lượng vòng train đầu tiên để dành 33% cuối tối ưu ổn định
+        max_custom_step = int(self.conf.n_iterations * 0.67)
+        if step >= 500 and step <= max_custom_step and step % 1000 == 0 and batch is not None:
             self.custom_bts_densification(train_dataset, batch)
 
         # Relocate dead gaussians to the alive areas
