@@ -1137,10 +1137,15 @@ class Trainer3DGRUT:
 
         profilers["step_total"].start()
 
+        # Bỏ qua bước validation thông thường để tăng tốc theo yêu cầu của người dùng
         # Perform validation if required
-        is_time_to_validate = (global_step > 0 or conf.validate_first) and (global_step % self.val_frequency == 0)
-        if is_time_to_validate:
-            self.run_validation_pass(conf)
+        # is_time_to_validate = (global_step > 0 or conf.validate_first) and (global_step % self.val_frequency == 0)
+        # if is_time_to_validate:
+        #     self.run_validation_pass(conf)
+
+        # Xuất ảnh ra đĩa tại các mốc 10000, 15000, 20000, 25000, 30000
+        if global_step in [10000, 15000, 20000, 25000, 30000]:
+            self.save_images_to_disk(global_step)
 
         # Compute the outputs of a single batch
         with torch.cuda.nvtx.range(f"train_{global_step}_fwd"):
@@ -1320,6 +1325,45 @@ class Trainer3DGRUT:
 
         self.log_training_pass(metrics)
 
+    @torch.no_grad()
+    def save_images_to_disk(self, step: int):
+        import os
+        import torchvision
+        
+        output_dir = os.path.join(self.conf.out_dir, f"renders_step_{step}")
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"💾 Saving test/validation renders to disk at: {output_dir}")
+        
+        if self.feature_decoder is not None:
+            self.feature_decoder.apply_ema_shadow()
+            
+        for val_iteration, batch_idx in enumerate(self.val_dataloader):
+            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
+            
+            outputs = self.model(gpu_batch, train=False)
+            if self.feature_decoder is not None:
+                outputs = apply_feature_decoder(
+                    self.feature_decoder,
+                    outputs,
+                    gpu_batch,
+                    training=False,
+                    center_ray_encoding=bool(getattr(self.conf.model.nht_decoder, "center_ray_encoding", False)),
+                )
+            outputs = apply_background(self.model.background, outputs, gpu_batch, training=False)
+            if self.post_processing is not None:
+                outputs = apply_post_processing(self.post_processing, outputs, gpu_batch, training=False)
+                
+            rgb_pred = outputs["pred_features"][-1].clip(0, 1.0)
+            img = rgb_pred.permute(2, 0, 1)
+            
+            img_path = os.path.join(output_dir, f"frame_{val_iteration:04d}.png")
+            torchvision.utils.save_image(img, img_path)
+            
+        if self.feature_decoder is not None:
+            self.feature_decoder.restore_ema()
+            
+        logger.info(f"✅ Successfully saved {len(self.val_dataloader)} images for step {step}!")
+
     @torch.cuda.nvtx.range(f"run_validation_pass")
     @torch.no_grad()
     def run_validation_pass(self, conf: DictConfig) -> dict[str, Any]:
@@ -1418,6 +1462,9 @@ class Trainer3DGRUT:
             self.run_train_pass(conf)
 
         logger.end_progress(task_name="Training")
+        
+        # Tự động xuất ảnh kết xuất tại step cuối cùng của quá trình huấn luyện
+        self.save_images_to_disk(self.global_step)
 
         # Report training statistics
         stats = logger.finished_tasks["Training"]
