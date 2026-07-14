@@ -51,6 +51,11 @@ def parse_args():
     parser.add_argument("--build_3d_min_baseline_angle", type=float, default=2.0)
     parser.add_argument("--build_3d_max_points", type=int, default=100000, help="Maximum points merged in points3D.txt to avoid OOM")
     
+    # Depth Anything V2 densification options
+    parser.add_argument("--enable_depth_densify", type=str, default="True", choices=["True", "False", "true", "false"], help="Enable depth-guided prior (Depth Anything V2) to densify Colmap")
+    parser.add_argument("--depth_model_path", type=str, default="depth-anything/Depth-Anything-V2-Small-hf")
+    parser.add_argument("--depth_stride", type=int, default=8, help="Stride for pixel downsampling when backprojecting")
+    
     # Paths
     parser.add_argument("--data_dir", type=str, default="/kaggle/input/datasets/phuongpn2/vai-nvs-data-phase-1/phase1/private_set1", help="Path to input dataset folder containing scenes")
     parser.add_argument("--output_dir", type=str, default="/kaggle/working/output", help="Output directory for checkpoints")
@@ -72,6 +77,7 @@ def parse_args():
     args.enable_custom_a_test = to_bool(args.enable_custom_a_test)
     args.enable_custom_b = to_bool(args.enable_custom_b)
     args.enable_build_3d = to_bool(args.enable_build_3d)
+    args.enable_depth_densify = to_bool(args.enable_depth_densify)
     args.dry_run = to_bool(args.dry_run)
     
     return args
@@ -225,8 +231,8 @@ def main():
                 scene = scenes_queue.pop(0)
                 orig_scene_dir = os.path.join(args.data_dir, scene)
                 
-                if args.enable_build_3d:
-                    print(f"\n[+] Processing build_3D reconstruction for {scene}...")
+                if args.enable_build_3d or args.enable_depth_densify:
+                    print(f"\n[+] Processing build_3D / depth_densify reconstruction for {scene}...")
                     # Working copy directory so we can write/modify points3D.txt
                     new_scene_dir = os.path.join("/tmp/data" if args.dry_run else "/kaggle/working/data", scene)
                     os.makedirs(new_scene_dir, exist_ok=True)
@@ -249,45 +255,60 @@ def main():
                         shutil.rmtree(new_train_sparse)
                     shutil.copytree(os.path.join(orig_scene_dir, "train", "sparse"), new_train_sparse)
                     
-                    # Run build_map.py
-                    print(f"[*] Running build_3D build_map.py for {scene}...")
-                    build_map_cmd = (
-                        f"python build_3D/build_map.py --dataset {new_scene_dir} --no_viewer "
-                        f"superpoint.max_keypoints={args.build_3d_max_keypoints} "
-                        f"superpoint.detection_threshold={args.build_3d_detection_threshold} "
-                        f"neighbor.position_weight={args.build_3d_position_weight} "
-                        f"neighbor.rotation_weight={args.build_3d_rotation_weight} "
-                        f"neighbor.num_neighbors={args.build_3d_num_neighbors} "
-                        f"graph.extra_links={args.build_3d_extra_links} "
-                        f"matching.min_matches={args.build_3d_min_matches} "
-                        f"matching.ransac_threshold={args.build_3d_ransac_threshold} "
-                        f"triangulation.reprojection_threshold={args.build_3d_reproj_threshold} "
-                        f"filter.min_track_length={args.build_3d_min_track_length} "
-                        f"filter.min_baseline_angle={args.build_3d_min_baseline_angle}"
-                    )
-                    
-                    if args.dry_run:
-                        print(f"[DRY-RUN] Would run: {build_map_cmd}")
-                    else:
-                        subprocess.run(build_map_cmd, shell=True, env=os.environ.copy())
-                    
-                    # Merge SuperPoint+LightGlue points into COLMAP sparse model
-                    print(f"[*] Merging SuperPoint+LightGlue points into sparse model for {scene}...")
-                    merge_cmd = f"python build_3D/merge_to_colmap.py --scene_path {new_scene_dir} --mode merge --max_points {args.build_3d_max_points}"
-                    
-                    if args.dry_run:
-                        print(f"[DRY-RUN] Would run: {merge_cmd}")
-                        # In dry_run, write a dummy points3D.txt to make sure downstream path is happy
-                        with open(os.path.join(new_train_sparse, "0", "points3D.txt"), "w") as f:
-                            f.write("# Dummy merged points")
-                    else:
-                        subprocess.run(merge_cmd, shell=True, env=os.environ.copy())
-                    
+                    # 1. Run SuperPoint+LightGlue if enabled
+                    if args.enable_build_3d:
+                        print(f"[*] Running build_3D build_map.py for {scene}...")
+                        build_map_cmd = (
+                            f"python build_3D/build_map.py --dataset {new_scene_dir} --no_viewer "
+                            f"superpoint.max_keypoints={args.build_3d_max_keypoints} "
+                            f"superpoint.detection_threshold={args.build_3d_detection_threshold} "
+                            f"neighbor.position_weight={args.build_3d_position_weight} "
+                            f"neighbor.rotation_weight={args.build_3d_rotation_weight} "
+                            f"neighbor.num_neighbors={args.build_3d_num_neighbors} "
+                            f"graph.extra_links={args.build_3d_extra_links} "
+                            f"matching.min_matches={args.build_3d_min_matches} "
+                            f"matching.ransac_threshold={args.build_3d_ransac_threshold} "
+                            f"triangulation.reprojection_threshold={args.build_3d_reproj_threshold} "
+                            f"filter.min_track_length={args.build_3d_min_track_length} "
+                            f"filter.min_baseline_angle={args.build_3d_min_baseline_angle}"
+                        )
+                        
+                        if args.dry_run:
+                            print(f"[DRY-RUN] Would run: {build_map_cmd}")
+                        else:
+                            subprocess.run(build_map_cmd, shell=True, env=os.environ.copy())
+                        
+                        # Merge SuperPoint+LightGlue points into COLMAP sparse model
+                        print(f"[*] Merging SuperPoint+LightGlue points into sparse model for {scene}...")
+                        merge_cmd = f"python build_3D/merge_to_colmap.py --scene_path {new_scene_dir} --mode merge --max_points {args.build_3d_max_points}"
+                        
+                        if args.dry_run:
+                            print(f"[DRY-RUN] Would run: {merge_cmd}")
+                            # In dry_run, write a dummy points3D.txt to make sure downstream path is happy
+                            with open(os.path.join(new_train_sparse, "0", "points3D.txt"), "w") as f:
+                                f.write("# Dummy merged points")
+                        else:
+                            subprocess.run(merge_cmd, shell=True, env=os.environ.copy())
+                            
+                    # 2. Run Depth Anything V2 densification if enabled
+                    if args.enable_depth_densify:
+                        print(f"[*] Running Depth Anything V2 densification for {scene}...")
+                        depth_cmd = f"python depth_densify.py --scene_path {new_scene_dir} --model_path {args.depth_model_path} --stride {args.depth_stride}"
+                        
+                        if args.dry_run:
+                            print(f"[DRY-RUN] Would run: {depth_cmd}")
+                            dummy_txt = os.path.join(new_train_sparse, "0", "points3D.txt")
+                            if not os.path.exists(dummy_txt):
+                                with open(dummy_txt, "w") as f:
+                                    f.write("# Dummy merged points")
+                        else:
+                            subprocess.run(depth_cmd, shell=True, env=os.environ.copy())
+                        
                     # Set train path to the modified copy
                     train_path = os.path.join(new_scene_dir, "train")
                 else:
                     train_path = os.path.join(orig_scene_dir, "train")
-                    print(f"[+] build_3D is disabled. Training directly from original: {train_path}")
+                    print(f"[+] build_3D and depth_densify are disabled. Training directly from original: {train_path}")
                     
                 # Build training command
                 cmd = (
