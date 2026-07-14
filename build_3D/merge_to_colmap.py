@@ -56,7 +56,39 @@ def main():
     bin_path = os.path.join(colmap_dir, "points3D.bin")
     txt_path = os.path.join(colmap_dir, "points3D.txt")
     
-    # Backup original points3D.bin if exists
+    final_pts = []
+    final_colors = []
+    final_errors = []
+    
+    # 1. Đọc điểm gốc nếu mode == "merge"
+    old_pts = []
+    old_colors = []
+    old_errors = []
+    if args.mode == "merge":
+        # Thử đọc qua pycolmap (hỗ trợ cả bin và txt của colmap rất nhanh)
+        try:
+            import pycolmap
+            if os.path.exists(colmap_dir):
+                print(f"[+] Reading original COLMAP reconstruction from {colmap_dir}...")
+                reconstruction = pycolmap.Reconstruction(colmap_dir)
+                for pt3d_id, pt3D in reconstruction.points3D.items():
+                    old_pts.append(pt3D.xyz.tolist())
+                    old_colors.append(pt3D.color.tolist())
+                    old_errors.append(pt3D.error)
+                print(f"[+] Loaded {len(old_pts)} original points using pycolmap.")
+        except Exception as e:
+            print(f"[-] Warning: pycolmap failed or not available: {e}")
+            
+        # Fallback nếu pycolmap không đọc được nhưng có file txt
+        if len(old_pts) == 0 and os.path.exists(txt_path):
+            print("[+] Fallback: Reading original points from points3D.txt...")
+            old_pts_arr, old_colors_arr, old_errors_arr = read_colmap_points3d_txt(txt_path)
+            if len(old_pts_arr) > 0:
+                old_pts = old_pts_arr.tolist()
+                old_colors = old_colors_arr.tolist()
+                old_errors = old_errors_arr.tolist()
+                
+    # 2. Bây giờ mới an toàn để rename/delete file points3D.bin cũ (để tránh Colmap ưu tiên đọc nhị phân cũ)
     if os.path.exists(bin_path):
         bak_bin = bin_path + ".bak"
         if not os.path.exists(bak_bin):
@@ -66,24 +98,19 @@ def main():
             os.remove(bin_path)
             print("[*] Removed points3D.bin to prioritize the new points3D.txt")
             
-    final_pts = []
-    final_colors = []
-    final_errors = []
-    
-    # Extract points from pkl
+    # 3. Trích xuất các điểm mới trích xuất từ SuperPoint+LightGlue
     for idx, pt in enumerate(sp_points):
         final_pts.append(pt["xyz"])
         c = pt["track"].get("color", [0.5, 0.5, 0.5])
         final_colors.append([int(c[0]*255), int(c[1]*255), int(c[2]*255)])
         final_errors.append(pt.get("avg_error", 1.0))
         
-    if args.mode == "merge" and os.path.exists(txt_path):
-        print("[+] Merging with original points...")
-        old_pts, old_colors, old_errors = read_colmap_points3d_txt(txt_path)
-        if len(old_pts) > 0:
-            final_pts.extend(old_pts.tolist())
-            final_colors.extend(old_colors.tolist())
-            final_errors.extend(old_errors.tolist())
+    # 4. Gộp điểm gốc vào danh sách
+    if len(old_pts) > 0:
+        print(f"[+] Merging {len(old_pts)} original points with {len(final_pts)} new points...")
+        final_pts.extend(old_pts)
+        final_colors.extend(old_colors)
+        final_errors.extend(old_errors)
             
     # Write to new points3D.txt
     print(f"[+] Writing {len(final_pts)} points to {txt_path}")
