@@ -1,14 +1,50 @@
 import os
+import struct
 import pickle
 import argparse
 import numpy as np
+
+def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
+    data = fid.read(num_bytes)
+    if not data:
+        return None
+    return struct.unpack(endian_character + format_char_sequence, data)
+
+def read_colmap_points3d_bin(path):
+    pts = []
+    colors = []
+    errors = []
+    if not os.path.exists(path):
+        return np.empty((0, 3)), np.empty((0, 3)), np.empty((0,))
+    try:
+        with open(path, "rb") as fid:
+            num_points_arr = read_next_bytes(fid, 8, "Q")
+            if num_points_arr is None:
+                return np.empty((0, 3)), np.empty((0, 3)), np.empty((0,))
+            num_points = num_points_arr[0]
+            for _ in range(num_points):
+                binary_point_line_properties = read_next_bytes(fid, num_bytes=43, format_char_sequence="QdddBBBd")
+                if binary_point_line_properties is None:
+                    break
+                pts.append(binary_point_line_properties[1:4])
+                colors.append(binary_point_line_properties[4:7])
+                errors.append(binary_point_line_properties[7])
+                
+                track_length_arr = read_next_bytes(fid, num_bytes=8, format_char_sequence="Q")
+                if track_length_arr is None:
+                    break
+                track_length = track_length_arr[0]
+                fid.seek(8 * track_length, 1)
+    except Exception as e:
+        print(f"[-] Error reading binary file {path}: {e}")
+    return np.array(pts), np.array(colors), np.array(errors)
 
 def read_colmap_points3d_txt(path):
     pts = []
     colors = []
     errors = []
     if not os.path.exists(path):
-        return pts, colors, errors
+        return np.empty((0, 3)), np.empty((0, 3)), np.empty((0,))
     with open(path, 'r') as f:
         for line in f:
             if line.startswith("#") or not line.strip():
@@ -27,6 +63,7 @@ def main():
     parser = argparse.ArgumentParser(description="Merge SuperPoint+LightGlue points into COLMAP sparse model")
     parser.add_argument("--scene_path", type=str, required=True, help="Path to scene dataset, e.g., data_phase1/public_set/hcm0031")
     parser.add_argument("--mode", type=str, default="replace", choices=["replace", "merge"], help="replace or merge with old points")
+    parser.add_argument("--max_points", type=int, default=100000, help="Maximum number of points to merge (not used, kept for compat)")
     args = parser.parse_args()
     
     scene_name = os.path.basename(os.path.normpath(args.scene_path))
@@ -54,6 +91,7 @@ def main():
         return
         
     bin_path = os.path.join(colmap_dir, "points3D.bin")
+    bak_bin = bin_path + ".bak"
     txt_path = os.path.join(colmap_dir, "points3D.txt")
     
     final_pts = []
@@ -65,11 +103,12 @@ def main():
     old_colors = []
     old_errors = []
     if args.mode == "merge":
-        # Thử đọc qua pycolmap (hỗ trợ cả bin và txt của colmap rất nhanh)
+        # Cách 1: Thử đọc bằng pycolmap nếu có thể (nhanh nhất)
         try:
             import pycolmap
-            if os.path.exists(colmap_dir):
-                print(f"[+] Reading original COLMAP reconstruction from {colmap_dir}...")
+            # Chỉ chạy pycolmap nếu points3D.bin hoặc points3D.txt tồn tại (pycolmap.Reconstruction cần nó)
+            if os.path.exists(colmap_dir) and (os.path.exists(bin_path) or os.path.exists(txt_path)):
+                print(f"[+] Reading original COLMAP reconstruction from {colmap_dir} via pycolmap...")
                 reconstruction = pycolmap.Reconstruction(colmap_dir)
                 for pt3d_id, pt3D in reconstruction.points3D.items():
                     old_pts.append(pt3D.xyz.tolist())
@@ -79,18 +118,30 @@ def main():
         except Exception as e:
             print(f"[-] Warning: pycolmap failed or not available: {e}")
             
-        # Fallback nếu pycolmap không đọc được nhưng có file txt
+        # Cách 2: Đọc trực tiếp từ file nhị phân (points3D.bin hoặc points3D.bin.bak) bằng python nguyên bản
+        if len(old_pts) == 0:
+            target_bin = bin_path if os.path.exists(bin_path) else (bak_bin if os.path.exists(bak_bin) else None)
+            if target_bin:
+                print(f"[+] Reading original points from binary file {target_bin}...")
+                pts_arr, colors_arr, errors_arr = read_colmap_points3d_bin(target_bin)
+                if len(pts_arr) > 0:
+                    old_pts = pts_arr.tolist()
+                    old_colors = colors_arr.tolist()
+                    old_errors = errors_arr.tolist()
+                    print(f"[+] Loaded {len(old_pts)} original points from binary file.")
+                    
+        # Cách 3: Đọc từ file text points3D.txt
         if len(old_pts) == 0 and os.path.exists(txt_path):
-            print("[+] Fallback: Reading original points from points3D.txt...")
-            old_pts_arr, old_colors_arr, old_errors_arr = read_colmap_points3d_txt(txt_path)
-            if len(old_pts_arr) > 0:
-                old_pts = old_pts_arr.tolist()
-                old_colors = old_colors_arr.tolist()
-                old_errors = old_errors_arr.tolist()
+            print("[+] Reading original points from points3D.txt...")
+            pts_arr, colors_arr, errors_arr = read_colmap_points3d_txt(txt_path)
+            if len(pts_arr) > 0:
+                old_pts = pts_arr.tolist()
+                old_colors = colors_arr.tolist()
+                old_errors = errors_arr.tolist()
+                print(f"[+] Loaded {len(old_pts)} original points from points3D.txt.")
                 
-    # 2. Bây giờ mới an toàn để rename/delete file points3D.bin cũ (để tránh Colmap ưu tiên đọc nhị phân cũ)
+    # 2. Rename/delete file points3D.bin cũ để Colmap bắt buộc đọc points3D.txt
     if os.path.exists(bin_path):
-        bak_bin = bin_path + ".bak"
         if not os.path.exists(bak_bin):
             os.rename(bin_path, bak_bin)
             print(f"[+] Backed up original binary to {bak_bin}")
