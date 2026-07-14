@@ -66,16 +66,23 @@ class LightGlueMatcher:
             pts1 = kpts1[matches[:, 0]]
             pts2 = kpts2[matches[:, 1]]
             
-            _, mask = cv2.findFundamentalMat(
-                pts1, pts2,
-                method=cv2.FM_RANSAC,
-                ransacReprojThreshold=ransac_threshold,
-                confidence=0.99,
-                maxIters=2000
-            )
+            pts1 = np.ascontiguousarray(pts1, dtype=np.float32)
+            pts2 = np.ascontiguousarray(pts2, dtype=np.float32)
             
-            if mask is not None:
-                inliers = mask.ravel().astype(bool)
+            if pts1.ndim == 2 and pts1.shape[0] >= 8:
+                try:
+                    _, mask = cv2.findFundamentalMat(
+                        pts1, pts2,
+                        method=cv2.FM_RANSAC,
+                        ransacReprojThreshold=ransac_threshold,
+                        confidence=0.99,
+                        maxIters=2000
+                    )
+                    
+                    if mask is not None:
+                        inliers = mask.ravel().astype(bool)
+                except Exception as e:
+                    print(f"[-] Warning: cv2.findFundamentalMat failed: {e}")
                 
         # Cleanup tensors
         del feats1
