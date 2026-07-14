@@ -287,7 +287,7 @@ def main():
         choices=["graph", "track", "all"],
         help="Force re-running reconstruction steps. Options: 'graph' (rebuild neighbor graph & match), 'track' (rebuild tracks & triangulate), 'all' (force rebuild everything)."
     )
-    args = parser.parse_args()
+    args, extra_args = parser.parse_known_args()
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = args.config if args.config else os.path.join(script_dir, "config.yaml")
@@ -296,6 +296,10 @@ def main():
         sys.exit(1)
         
     config = OmegaConf.load(config_path)
+    if len(extra_args) > 0:
+        cli_config = OmegaConf.from_cli(extra_args)
+        config = OmegaConf.merge(config, cli_config)
+        
     if args.dataset:
         config.dataset.path = args.dataset
         
