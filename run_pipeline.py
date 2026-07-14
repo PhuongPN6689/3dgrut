@@ -95,23 +95,39 @@ def setup_cuda_environment():
 
 def main():
     args = parse_args()
+    
+    # Resolve relative paths to absolute paths before changing directory
+    if args.data_dir:
+        args.data_dir = os.path.abspath(args.data_dir)
+    if args.output_dir:
+        args.output_dir = os.path.abspath(args.output_dir)
+    if args.submission_dir:
+        args.submission_dir = os.path.abspath(args.submission_dir)
+    if args.zip_path:
+        args.zip_path = os.path.abspath(args.zip_path)
+
+    # Change working directory to the script's directory (3dgrut)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(script_dir)
+    print(f"[+] Working directory changed to script location: {os.getcwd()}")
+    
     setup_cuda_environment()
     
     print("=== Configuration ===")
     for k, v in vars(args).items():
         print(f"  {k}: {v}")
         
-    # Auto-detect data_dir if default does not exist (or use public_set if local)
+    # Auto-detect data_dir if default does not exist
     if not os.path.exists(args.data_dir):
-        # Local search fallback for testing
-        local_public = "data_phase1/public_set"
+        # Local search fallback for testing (relative to script location inside 3dgrut)
+        local_public = "../data_phase1/public_set"
         if os.path.exists(local_public):
-            args.data_dir = local_public
+            args.data_dir = os.path.abspath(local_public)
             print(f"[+] Local fallback detected data_dir at: {args.data_dir}")
         else:
             found = glob.glob("/kaggle/input/**/private_set1", recursive=True)
             if found:
-                args.data_dir = found[0]
+                args.data_dir = os.path.abspath(found[0])
                 print(f"[+] Automatically detected data_dir at: {args.data_dir}")
             else:
                 print(f"[-] Error: Dataset directory not found at {args.data_dir}")

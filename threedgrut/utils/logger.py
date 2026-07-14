@@ -47,7 +47,7 @@ class IterationSpeedColumn(ProgressColumn):
 
 
 class RichLogger:
-    console = Console()
+    console = Console(log_time=False, log_path=False)
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),

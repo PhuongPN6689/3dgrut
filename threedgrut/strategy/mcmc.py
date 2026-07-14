@@ -219,12 +219,24 @@ class MCMCStrategy(BaseStrategy):
             self.conf.strategy.binom_n_max,
         )
 
+        # Clamp new_densities and handle any NaNs/Infs
+        new_densities = torch.where(
+            torch.isnan(new_densities) | torch.isinf(new_densities),
+            torch.tensor(self.conf.strategy.opacity_threshold, device=new_densities.device, dtype=new_densities.dtype),
+            new_densities
+        )
         new_densities = self.model.density_activation_inv(
             torch.clamp(
                 new_densities, max=1.0 - torch.finfo(torch.float32).eps, min=self.conf.strategy.opacity_threshold
             )
         )
 
-        new_scales = self.model.scale_activation_inv(new_scales)
+        # Replace NaNs/Infs in new_scales and clamp to prevent log(0) -> -inf
+        new_scales = torch.where(
+            torch.isnan(new_scales) | torch.isinf(new_scales),
+            torch.tensor(1e-8, device=new_scales.device, dtype=new_scales.dtype),
+            new_scales
+        )
+        new_scales = self.model.scale_activation_inv(torch.clamp(new_scales, min=1e-8))
 
         return sampled_idxs, new_densities, new_scales

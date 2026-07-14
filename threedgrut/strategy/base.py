@@ -566,7 +566,7 @@ class BaseStrategy:
                     for pt in new_pts_a_train:
                         color = self._project_point_to_camera_color(pt, train_camera, train_rgb) if train_rgb is not None else None
                         if color is None:
-                            color = torch.tensor([float('nan'), float('nan'), float('nan')], device=points_3d.device)
+                            color = torch.tensor([0.5, 0.5, 0.5], device=points_3d.device)
                         train_colors.append(color)
                     new_colors_list.append(torch.stack(train_colors, dim=0))
                     logger.info(f"✨ [Cách A - Train] Added {new_pts_a_train.shape[0]} custom plane points.")
@@ -621,7 +621,7 @@ class BaseStrategy:
                             color = None
                             
                         if color is None:
-                            color = torch.tensor([float('nan'), float('nan'), float('nan')], device=points_3d.device)
+                            color = torch.tensor([0.5, 0.5, 0.5], device=points_3d.device)
                         test_colors.append(color)
                         
                     new_colors_list.append(torch.stack(test_colors, dim=0))
@@ -637,7 +637,7 @@ class BaseStrategy:
                 for pt in new_pts_b:
                     color = self._project_point_to_camera_color(pt, train_camera, train_rgb) if (train_rgb is not None and 'train_camera' in locals()) else None
                     if color is None:
-                        color = torch.tensor([float('nan'), float('nan'), float('nan')], device=points_3d.device)
+                        color = torch.tensor([0.5, 0.5, 0.5], device=points_3d.device)
                     b_colors.append(color)
                 new_colors_list.append(torch.stack(b_colors, dim=0))
                 logger.info(f"✨ [Cách B] Added {new_pts_b.shape[0]} custom edge-guided points.")
@@ -651,28 +651,32 @@ class BaseStrategy:
     def add_custom_points(self, new_positions, new_colors=None):
         num_new = new_positions.shape[0]
         
-        mean_scale = self.model.scale.mean(dim=0, keepdim=True).repeat(num_new, 1)
+        def safe_mean(tensor, default_val=0.0):
+            m = torch.nanmean(tensor, dim=0, keepdim=True)
+            return torch.where(torch.isnan(m) | torch.isinf(m), torch.tensor(default_val, device=tensor.device, dtype=tensor.dtype), m)
+            
+        mean_scale = safe_mean(self.model.scale, -2.0).repeat(num_new, 1)
         mean_rotation = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.model.device).repeat(num_new, 1)
-        mean_density = self.model.density.mean(dim=0, keepdim=True).repeat(num_new, 1)
+        mean_density = safe_mean(self.model.density, 0.1).repeat(num_new, 1)
         
         if self.model.feature_type.name == "SH":
             if new_colors is not None:
                 new_albedo = (new_colors - 0.5) / 0.28209479177387814
-                mean_albedo = self.model.features_albedo.mean(dim=0, keepdim=True).repeat(num_new, 1)
+                mean_albedo = safe_mean(self.model.features_albedo, 0.0).repeat(num_new, 1)
                 valid_color_mask = ~torch.isnan(new_colors).any(dim=-1)
                 mean_albedo[valid_color_mask] = new_albedo[valid_color_mask]
             else:
-                mean_albedo = self.model.features_albedo.mean(dim=0, keepdim=True).repeat(num_new, 1)
-            mean_specular = self.model.features_specular.mean(dim=0, keepdim=True).repeat(num_new, 1)
+                mean_albedo = safe_mean(self.model.features_albedo, 0.0).repeat(num_new, 1)
+            mean_specular = safe_mean(self.model.features_specular, 0.0).repeat(num_new, 1)
         else:
             if new_colors is not None:
-                mean_features = self.model.features.mean(dim=0, keepdim=True).repeat(num_new, 1)
+                mean_features = safe_mean(self.model.features, 0.0).repeat(num_new, 1)
                 valid_color_mask = ~torch.isnan(new_colors).any(dim=-1)
                 padded_colors = torch.zeros((num_new, mean_features.shape[1]), device=self.model.device)
                 padded_colors[:, :3] = new_colors
                 mean_features[valid_color_mask] = padded_colors[valid_color_mask]
             else:
-                mean_features = self.model.features.mean(dim=0, keepdim=True).repeat(num_new, 1)
+                mean_features = safe_mean(self.model.features, 0.0).repeat(num_new, 1)
 
         def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
             if name == "positions":
