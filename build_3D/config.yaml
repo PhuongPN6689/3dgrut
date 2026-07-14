@@ -1,0 +1,30 @@
+dataset:
+  # path: "data/public_set/hcm0031"
+  path: "data/public_set/hcm0034"
+  device: "cuda"
+
+superpoint:
+  max_keypoints: 16384
+  detection_threshold: 0.0001
+
+neighbor:
+  position_weight: 1.0
+  rotation_weight: 0.0
+  num_neighbors: 6
+
+graph:
+  extra_links: 2
+
+matching:
+  min_matches: 30
+  ransac_threshold: 2.0
+
+triangulation:
+  reprojection_threshold: 2.5
+
+filter:
+  min_track_length: 2
+  min_baseline_angle: 0.5
+
+viewer:
+  point_size: 2.0

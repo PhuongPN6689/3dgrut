@@ -530,8 +530,12 @@ class BaseStrategy:
         new_pts_list = []
         new_colors_list = []
         
+        enable_custom_a_train = getattr(self.conf.strategy, "enable_custom_a_train", True)
+        enable_custom_a_test = getattr(self.conf.strategy, "enable_custom_a_test", True)
+        enable_custom_b = getattr(self.conf.strategy, "enable_custom_b", True)
+        
         # 1. CÁCH A: Phóng tia từ camera train hiện tại - bổ sung 50 điểm thưa nhất hợp lệ
-        if batch.T_to_world is not None:
+        if enable_custom_a_train and batch.T_to_world is not None:
             c2w = batch.T_to_world[0]
             w2c = torch.inverse(c2w)
             
@@ -568,7 +572,7 @@ class BaseStrategy:
                     logger.info(f"✨ [Cách A - Train] Added {new_pts_a_train.shape[0]} custom plane points.")
         
         # 2. CÁCH A: Phóng tia từ toàn bộ các camera test - tổng cộng bổ sung đúng 300 điểm
-        if len(self.test_cameras) > 0 and train_dataset is not None:
+        if enable_custom_a_test and len(self.test_cameras) > 0 and train_dataset is not None:
             test_rays_o_list = []
             test_rays_d_list = []
             test_cameras_used = []
@@ -624,18 +628,19 @@ class BaseStrategy:
                     logger.info(f"✨ [Cách A - Test] Added {new_pts_a_test.shape[0]} custom plane points from Test viewpoints.")
         
         # 3. CÁCH B: Bổ sung góc/cạnh dọc theo biên dạng 3D - bổ sung đúng 100 điểm
-        new_pts_b = self._edge_guided_3d_interpolation(points_3d, batch, edge_threshold=0.1, n_interpolate=3, target_points=100)
-        if new_pts_b.shape[0] > 0:
-            new_pts_list.append(new_pts_b)
-            train_rgb = batch.rgb_gt[0] if batch.rgb_gt is not None else None
-            b_colors = []
-            for pt in new_pts_b:
-                color = self._project_point_to_camera_color(pt, train_camera, train_rgb) if (train_rgb is not None and 'train_camera' in locals()) else None
-                if color is None:
-                    color = torch.tensor([float('nan'), float('nan'), float('nan')], device=points_3d.device)
-                b_colors.append(color)
-            new_colors_list.append(torch.stack(b_colors, dim=0))
-            logger.info(f"✨ [Cách B] Added {new_pts_b.shape[0]} custom edge-guided points.")
+        if enable_custom_b:
+            new_pts_b = self._edge_guided_3d_interpolation(points_3d, batch, edge_threshold=0.1, n_interpolate=3, target_points=100)
+            if new_pts_b.shape[0] > 0:
+                new_pts_list.append(new_pts_b)
+                train_rgb = batch.rgb_gt[0] if batch.rgb_gt is not None else None
+                b_colors = []
+                for pt in new_pts_b:
+                    color = self._project_point_to_camera_color(pt, train_camera, train_rgb) if (train_rgb is not None and 'train_camera' in locals()) else None
+                    if color is None:
+                        color = torch.tensor([float('nan'), float('nan'), float('nan')], device=points_3d.device)
+                    b_colors.append(color)
+                new_colors_list.append(torch.stack(b_colors, dim=0))
+                logger.info(f"✨ [Cách B] Added {new_pts_b.shape[0]} custom edge-guided points.")
             
         if len(new_pts_list) > 0:
             added_points = torch.cat(new_pts_list, dim=0)

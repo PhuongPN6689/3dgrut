@@ -1292,8 +1292,9 @@ class Trainer3DGRUT:
         with torch.cuda.nvtx.range(f"train_{global_step - 1}_log_iter"):
             self.log_training_iter(gpu_batch, outputs, batch_metrics, iter)
         with torch.cuda.nvtx.range(f"train_{global_step - 1}_save_ckpt"):
+            # Vô hiệu hóa việc lưu checkpoint riêng lẻ gây nặng đĩa, chỉ ghi đè lên ckpt_last.pt
             if global_step in conf.checkpoint.iterations:
-                self.save_checkpoint()
+                self.save_checkpoint(last_checkpoint=True)
 
         # Updating the GUI
         with torch.cuda.nvtx.range(f"train_{global_step - 1}_update_gui"):
@@ -1329,11 +1330,18 @@ class Trainer3DGRUT:
     def save_images_to_disk(self, step: int):
         import os
         import shutil
-        import torchvision
-        import pandas as pd
+        import subprocess
         import zipfile
         
-        # 1. Tìm đường dẫn file test_poses.csv
+        # 1. Lưu checkpoint hiện tại của mô hình
+        self.save_checkpoint(last_checkpoint=True)
+        ckpt_path = os.path.abspath(os.path.join(self.tracking.output_dir, "ckpt_last.pt"))
+        
+        if not os.path.exists(ckpt_path):
+            logger.error(f"❌ Checkpoint not found at {ckpt_path}. Cannot perform rendering.")
+            return
+            
+        # 2. Tìm đường dẫn file test_poses.csv
         parent_path = self.conf.path
         if parent_path.rstrip("/").endswith("train"):
             parent_path = os.path.dirname(parent_path.rstrip("/"))
@@ -1345,22 +1353,19 @@ class Trainer3DGRUT:
             csv_path = os.path.join(self.conf.path, "test_poses.csv")
             
         if not os.path.exists(csv_path):
-            logger.warning(f"⚠️ test_poses.csv not found, fallback to default names.")
-            image_names = [f"frame_{idx:04d}.png" for idx in range(len(self.val_dataloader))]
-        else:
-            df = pd.read_csv(csv_path)
-            image_names = df['image_name'].tolist()
+            logger.error(f"❌ test_poses.csv not found. Cannot perform rendering.")
+            return
             
-        # 2. Xác định thư mục lưu ảnh (theo cấu trúc submission chuẩn)
+        # 3. Xác định thư mục lưu ảnh (theo cấu trúc submission chuẩn)
         scene_name = getattr(self.conf, "experiment_name", "scene")
         
         # Kiểm tra xem có đang chạy trên Kaggle không
         if os.path.exists("/kaggle/working"):
             submission_dir = "/kaggle/working/submission"
-            zip_path = f"/kaggle/working/submission_step_{step}.zip"
+            zip_path = f"/kaggle/working/submission_{scene_name}_step_{step}.zip"
         else:
             submission_dir = os.path.join(self.conf.out_dir, "submission")
-            zip_path = os.path.join(self.conf.out_dir, f"submission_step_{step}.zip")
+            zip_path = os.path.join(self.conf.out_dir, f"submission_{scene_name}_step_{step}.zip")
             
         output_dir = os.path.join(submission_dir, scene_name)
         
@@ -1369,40 +1374,32 @@ class Trainer3DGRUT:
             shutil.rmtree(output_dir)
         os.makedirs(output_dir, exist_ok=True)
         
-        logger.info(f"💾 Saving test/validation renders to submission folder: {output_dir}")
+        # 4. Tìm render_submission.py và gọi lệnh render chuẩn của cuộc thi
+        render_script = "render_submission.py"
+        if not os.path.exists(render_script):
+            render_script = "../render_submission.py"
+        if not os.path.exists(render_script):
+            render_script = "/kaggle/working/3dgrut/render_submission.py"
+            
+        if not os.path.exists(render_script):
+            logger.error(f"❌ render_submission.py not found. Cannot perform rendering.")
+            return
+            
+        cmd = f"python {render_script} -m {ckpt_path} -p {csv_path} -o {output_dir}"
+        logger.info(f"🚀 Running standard rendering command: {cmd}")
         
-        if self.feature_decoder is not None:
-            self.feature_decoder.apply_ema_shadow()
+        try:
+            env = os.environ.copy()
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+            if result.returncode != 0:
+                logger.error(f"❌ Rendering failed with exit code {result.returncode}: {result.stderr}")
+                return
+            logger.info(f"✅ Rendering completed successfully!")
+        except Exception as e:
+            logger.error(f"❌ Failed to run rendering process: {e}")
+            return
             
-        for val_iteration, batch_idx in enumerate(self.val_dataloader):
-            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
-            
-            outputs = self.model(gpu_batch, train=False)
-            if self.feature_decoder is not None:
-                outputs = apply_feature_decoder(
-                    self.feature_decoder,
-                    outputs,
-                    gpu_batch,
-                    training=False,
-                    center_ray_encoding=bool(getattr(self.conf.model.nht_decoder, "center_ray_encoding", False)),
-                )
-            outputs = apply_background(self.model.background, outputs, gpu_batch, training=False)
-            if self.post_processing is not None:
-                outputs = apply_post_processing(self.post_processing, outputs, gpu_batch, training=False)
-                
-            rgb_pred = outputs["pred_features"][-1].clip(0, 1.0)
-            img = rgb_pred.permute(2, 0, 1)
-            
-            image_name = image_names[val_iteration] if val_iteration < len(image_names) else f"frame_{val_iteration:04d}.png"
-            img_path = os.path.join(output_dir, image_name)
-            torchvision.utils.save_image(img, img_path)
-            
-        if self.feature_decoder is not None:
-            self.feature_decoder.restore_ema()
-            
-        logger.info(f"✅ Successfully saved {len(self.val_dataloader)} images for step {step}!")
-        
-        # 3. Đóng gói zip thư mục submission lại luôn
+        # 5. Đóng gói zip thư mục submission lại luôn
         logger.info(f"🤐 Packaging submission folder into zip: {zip_path}")
         try:
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:

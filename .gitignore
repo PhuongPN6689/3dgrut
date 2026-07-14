@@ -45,3 +45,8 @@ tools/**/.pytest_cache/
 
 # Standalone validation skill repo (lives in-tree during the transition).
 /threedgrut_usd_validation/
+
+# build_3D cache ignore
+build_3D/cache/
+build_3D/features/superpoint/assets/
+build_3D/matching/lightglue/assets/
