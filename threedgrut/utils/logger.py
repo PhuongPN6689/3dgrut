@@ -50,12 +50,12 @@ class RichLogger:
     console = Console(log_time=False, log_path=False)
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
+        # BarColumn(),
+        # TaskProgressColumn(),
         TextColumn("{task.fields[additional_info]}"),
-        TextColumn(":: 🚗💨 [red]Speed:"),
+        TextColumn(" [red]Speed:"),
         IterationSpeedColumn(),
-        TextColumn(":: 🕒 [yellow]Elapsed:"),
+        TextColumn(" [yellow]Elapsed:"),
         TimeElapsedColumn(),
         console=console,
         transient=True,
