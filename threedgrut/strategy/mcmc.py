@@ -191,7 +191,7 @@ class MCMCStrategy(BaseStrategy):
         noise = torch.bmm(covariance, noise.unsqueeze(-1)).squeeze(-1)
 
         self.model.positions.add_(noise)
-        logger.info(f"Perturbed {len(positions)} gaussians with noise scale {self.conf.strategy.perturb.noise_lr * current_lr}")
+        # logger.info(f"Perturbed {len(positions)} gaussians with noise scale {self.conf.strategy.perturb.noise_lr * current_lr}")
 
     def sample_new_gaussians(
         self, num_gaussians: int, valid_indices: Optional[torch.Tensor] = None
