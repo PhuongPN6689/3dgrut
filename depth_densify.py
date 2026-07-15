@@ -215,7 +215,7 @@ def main():
             # Fallback to standard polyfit
             a, b = np.polyfit(D_ref, D_col, 1)
             
-        print(f"{base_image_print} Alignment (inverse={use_inverse}): scale={a:.4f}, shift={b:.4f} (corr: direct={corr_direct:.3f}, inverse={corr_inverse:.3f})")
+        # print(f"{base_image_print} Alignment (inverse={use_inverse}): scale={a:.4f}, shift={b:.4f} (corr: direct={corr_direct:.3f}, inverse={corr_inverse:.3f})")
         
         # Calculate absolute depth map
         D_abs = a * D_ref_full + b
