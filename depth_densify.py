@@ -129,10 +129,11 @@ def main():
         img_name = colmap_image.name
         img_path = os.path.join(images_dir, img_name)
         if not os.path.exists(img_path):
-            print(f"[WARNING] Image file not found: {img_path}")
+            # print(f"[WARNING] Image file not found: {img_path}")
             continue
             
-        print(f"[*] [{img_idx+1}/{len(reconstruction.images)}] Aligning depth for image: {img_name}")
+        # print(f"[*] [{img_idx+1}/{len(reconstruction.images)}] Aligning depth for image: {img_name}")
+        base_image_print = f"[{img_idx+1}/{len(reconstruction.images)} - {img_name}]"
         processed += 1
         
         # Load image
@@ -179,7 +180,7 @@ def main():
                     
         # 3. Perform Scale-Shift Alignment
         if len(pts_colmap_depth) < 10:
-            print(f"[WARNING] Not enough keypoints ({len(pts_colmap_depth)}) on {img_name} for depth alignment. Skipping...")
+            print(f"[WARNING] {base_image_print} Not enough keypoints ({len(pts_colmap_depth)}) on for depth alignment. Skipping...")
             continue
             
         D_col = np.array(pts_colmap_depth)
@@ -214,7 +215,7 @@ def main():
             # Fallback to standard polyfit
             a, b = np.polyfit(D_ref, D_col, 1)
             
-        print(f"    - Alignment (inverse={use_inverse}): scale={a:.4f}, shift={b:.4f} (corr: direct={corr_direct:.3f}, inverse={corr_inverse:.3f})")
+        print(f"{base_image_print} Alignment (inverse={use_inverse}): scale={a:.4f}, shift={b:.4f} (corr: direct={corr_direct:.3f}, inverse={corr_inverse:.3f})")
         
         # Calculate absolute depth map
         D_abs = a * D_ref_full + b
@@ -235,9 +236,12 @@ def main():
         depths = D_abs[v_flat, u_flat]
         colors = img_np[v_flat, u_flat]
         
-        # Compute camera space coordinates
-        X_cam = (u_flat - cx) * depths / fx
-        Y_cam = (v_flat - cy) * depths / fy
+        # Compute camera space coordinates correcting for camera lens distortion
+        pixel_coords = np.stack([u_flat, v_flat], axis=1).astype(np.float64)
+        normalized_coords = camera.cam_from_img(pixel_coords) # [N, 2], containing [x_norm, y_norm]
+        
+        X_cam = normalized_coords[:, 0] * depths
+        Y_cam = normalized_coords[:, 1] * depths
         Z_cam = depths
         
         P_cam_all = np.stack([X_cam, Y_cam, Z_cam], axis=1) # [N, 3]

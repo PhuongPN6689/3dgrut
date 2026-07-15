@@ -90,7 +90,7 @@ class MCMCStrategy(BaseStrategy):
             self.conf.strategy.relocate.end_iteration,
             self.conf.strategy.relocate.frequency,
         ):
-            self.relocate_gaussians()
+            self.relocate_gaussians(step)
 
         # Add new Gaussians if the maximum number has not been reached
         if check_step_condition(
@@ -99,7 +99,7 @@ class MCMCStrategy(BaseStrategy):
             self.conf.strategy.add.end_iteration,
             self.conf.strategy.add.frequency,
         ):
-            self.add_new_gaussians()
+            self.add_new_gaussians(step)
 
         # Perturb the positions of the Gaussians
         if check_step_condition(
@@ -108,12 +108,12 @@ class MCMCStrategy(BaseStrategy):
             self.conf.strategy.perturb.end_iteration,
             self.conf.strategy.perturb.frequency,
         ):
-            self.perturb_gaussians()
+            self.perturb_gaussians(step)
 
         return True
 
     @torch.no_grad()
-    def relocate_gaussians(self) -> None:
+    def relocate_gaussians(self, step: int) -> None:
         # Get the per Gaussian densities and scales (after sigmoid)
         densities = self.model.get_density()
         # Find the dead indices
@@ -138,11 +138,11 @@ class MCMCStrategy(BaseStrategy):
 
             self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
 
-        if self.conf.strategy.print_stats:
-            logger.info(f"Relocated {n_dead_gaussians} ({n_dead_gaussians / len(densities) * 100:.2f}%) gaussians")
+        if self.conf.strategy.print_stats and step % 500 == 0:
+            logger.info(f"Relocated {n_dead_gaussians} / {len(densities)} ({n_dead_gaussians / len(densities) * 100:.2f}%) gaussians")
 
     @torch.no_grad()
-    def add_new_gaussians(self) -> None:
+    def add_new_gaussians(self, step: int) -> None:
         # Get the current number of gaussians
         current_num_gaussians = self.model.num_gaussians
         target_num_gaussians = min(self.conf.strategy.add.max_n_gaussians, int(1.05 * current_num_gaussians))
@@ -165,13 +165,13 @@ class MCMCStrategy(BaseStrategy):
 
             self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
 
-        if self.conf.strategy.print_stats:
+        if self.conf.strategy.print_stats and step % 500 == 0 and num_gaussians_to_add > 0:
             logger.info(
-                f"Added {num_gaussians_to_add} ({num_gaussians_to_add / current_num_gaussians * 100:.2f}%) gaussians"
+                f"Added {num_gaussians_to_add} / {current_num_gaussians} ({num_gaussians_to_add / current_num_gaussians * 100:.2f}%) gaussians"
             )
 
     @torch.no_grad()
-    def perturb_gaussians(self) -> None:
+    def perturb_gaussians(self, step: int) -> None:
         covariance = self.model.get_covariance()
         positions = self.model.get_positions()
         densities = self.model.get_density()
@@ -191,6 +191,7 @@ class MCMCStrategy(BaseStrategy):
         noise = torch.bmm(covariance, noise.unsqueeze(-1)).squeeze(-1)
 
         self.model.positions.add_(noise)
+        logger.info(f"Perturbed {len(positions)} gaussians with noise scale {self.conf.strategy.perturb.noise_lr * current_lr}")
 
     def sample_new_gaussians(
         self, num_gaussians: int, valid_indices: Optional[torch.Tensor] = None
