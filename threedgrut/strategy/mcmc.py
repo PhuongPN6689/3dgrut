@@ -165,7 +165,7 @@ class MCMCStrategy(BaseStrategy):
 
             self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
 
-        if self.conf.strategy.print_stats and step % 500 == 0 and num_gaussians_to_add > 0:
+        if self.conf.strategy.print_stats and num_gaussians_to_add > 0:
             logger.info(
                 f"Step {step}: Added {num_gaussians_to_add} / {current_num_gaussians} ({num_gaussians_to_add / current_num_gaussians * 100:.2f}%) gaussians"
             )
