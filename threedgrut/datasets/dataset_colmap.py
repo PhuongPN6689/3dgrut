@@ -195,6 +195,84 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # Update the number of frames to only include the samples from the split
         self.n_frames = self.poses.shape[0]
 
+        # Target-aware over-sampling of training cameras closest to test poses
+        if self.split == "train":
+            repeats = int(os.environ.get("OVERSAMPLE_TEST_NEIGHBORS", "2"))
+            if repeats > 0:
+                test_poses_paths = [
+                    os.path.join(os.path.dirname(self.path), "test", "test_poses.csv"),
+                    os.path.join(os.path.dirname(os.path.dirname(self.path)), "test", "test_poses.csv"),
+                    os.path.join(self.path, "test", "test_poses.csv"),
+                ]
+                test_poses_path = None
+                for p in test_poses_paths:
+                    if os.path.exists(p):
+                        test_poses_path = p
+                        break
+                        
+                if test_poses_path:
+                    import csv
+                    test_centers = []
+                    try:
+                        with open(test_poses_path, "r", encoding="utf-8") as f:
+                            reader = csv.DictReader(f)
+                            for row in reader:
+                                qw = float(row["qw"])
+                                qx = float(row["qx"])
+                                qy = float(row["qy"])
+                                qz = float(row["qz"])
+                                tx = float(row["tx"])
+                                ty = float(row["ty"])
+                                tz = float(row["tz"])
+                                
+                                qvec = np.array([qw, qx, qy, qz])
+                                R = qvec_to_so3(qvec)
+                                tvec = np.array([tx, ty, tz])
+                                cam_center = -R.T @ tvec
+                                test_centers.append(cam_center)
+                    except Exception as e:
+                        logger.warning(f"[-] Error loading test_poses.csv at {test_poses_path}: {e}")
+                        
+                    if len(test_centers) > 0 and len(self.camera_centers) > 0:
+                        test_centers = np.array(test_centers)
+                        dup_indices = []
+                        
+                        # Compute dynamic distance threshold based on training camera steps
+                        consec_dists = np.linalg.norm(self.camera_centers[1:] - self.camera_centers[:-1], axis=1)
+                        avg_neighbor_dist = np.mean(consec_dists) if len(consec_dists) > 0 else 1.0
+                        max_allowed_dist = avg_neighbor_dist * 2.0
+                        logger.info(f"[+] Trajectory neighbor distance: {avg_neighbor_dist:.4f}, max allowed for over-sampling: {max_allowed_dist:.4f}")
+                        
+                        for tc in test_centers:
+                            dists = np.linalg.norm(self.camera_centers - tc, axis=1)
+                            sorted_idx = np.argsort(dists)
+                            
+                            # Select top 2 closest training cameras within the distance threshold
+                            for rank in range(2):
+                                idx = sorted_idx[rank]
+                                dist = dists[idx]
+                                if dist <= max_allowed_dist:
+                                    dup_indices.append(idx)
+                                    
+                        # Remove duplicates to avoid over-sampling a training camera multiple times
+                        dup_indices = sorted(list(set(dup_indices)))
+                        
+                        all_indices = list(range(self.n_frames))
+                        for idx in dup_indices:
+                            all_indices.extend([idx] * repeats)
+                            
+                        # Apply to all attributes
+                        self.cam_extrinsics = [self.cam_extrinsics[i] for i in all_indices]
+                        self.poses = self.poses[all_indices]
+                        self.image_paths = self.image_paths[all_indices]
+                        self.mask_paths = self.mask_paths[all_indices]
+                        self.camera_centers = self.camera_centers[all_indices]
+                        if self.exif_exposures is not None:
+                            self.exif_exposures = [self.exif_exposures[i] for i in all_indices]
+                            
+                        self.n_frames = len(self.poses)
+                        logger.info(f"[+] Over-sampled {len(dup_indices)} training views closest to test poses by {repeats}x. New training dataset size: {self.n_frames}")
+
         # Clear existing worker caches to force recreation with new intrinsics
         self._worker_gpu_cache.clear()
 

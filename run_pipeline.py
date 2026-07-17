@@ -55,6 +55,11 @@ def parse_args():
     parser.add_argument("--enable_depth_densify", type=str, default="True", choices=["True", "False", "true", "false"], help="Enable depth-guided prior (Depth Anything V2) to densify Colmap")
     parser.add_argument("--depth_model_path", type=str, default="depth-anything/Depth-Anything-V2-Small-hf")
     parser.add_argument("--depth_stride", type=int, default=8, help="Stride for pixel downsampling when backprojecting")
+    parser.add_argument("--depth_voxel_size_ratio", type=float, default=0.002)
+    parser.add_argument("--depth_radial_decay_sigma", type=float, default=0.6)
+    parser.add_argument("--depth_radial_decay_min", type=float, default=0.2)
+    parser.add_argument("--depth_decay_coef", type=float, default=1.5)
+    parser.add_argument("--enable_color_align", type=str, default="True", choices=["True", "False", "true", "false"], help="Enable Reinhard-style global exposure alignment across training views")
     
     # Paths
     parser.add_argument("--data_dir", type=str, default="/kaggle/input/datasets/phuongpn2/vai-nvs-data-phase-1/phase1/private_set1", help="Path to input dataset folder containing scenes")
@@ -78,6 +83,7 @@ def parse_args():
     args.enable_custom_b = to_bool(args.enable_custom_b)
     args.enable_build_3d = to_bool(args.enable_build_3d)
     args.enable_depth_densify = to_bool(args.enable_depth_densify)
+    args.enable_color_align = to_bool(args.enable_color_align)
     args.dry_run = to_bool(args.dry_run)
     
     return args
@@ -237,11 +243,22 @@ def main():
                     new_scene_dir = os.path.join("/tmp/data" if args.dry_run else "/kaggle/working/data", scene)
                     os.makedirs(new_scene_dir, exist_ok=True)
                     
-                    # Symlink images
+                    # Copy or symlink images
                     new_train_images = os.path.join(new_scene_dir, "train", "images")
                     if not os.path.lexists(new_train_images):
                         os.makedirs(os.path.dirname(new_train_images), exist_ok=True)
-                        os.symlink(os.path.join(orig_scene_dir, "train", "images"), new_train_images, target_is_directory=True)
+                        if args.enable_color_align:
+                            print(f"[*] Copying training images to writable folder for color alignment...")
+                            shutil.copytree(os.path.join(orig_scene_dir, "train", "images"), new_train_images)
+                            # Run color alignment
+                            print(f"[*] Aligning colors and exposures...")
+                            color_align_cmd = f"python color_align.py --image_dir {new_train_images}"
+                            if args.dry_run:
+                                print(f"[DRY-RUN] Would run: {color_align_cmd}")
+                            else:
+                                subprocess.run(color_align_cmd, shell=True, env=os.environ.copy())
+                        else:
+                            os.symlink(os.path.join(orig_scene_dir, "train", "images"), new_train_images, target_is_directory=True)
                         
                     # Symlink test poses
                     new_test_dir = os.path.join(new_scene_dir, "test")
@@ -293,7 +310,7 @@ def main():
                     # 2. Run Depth Anything V2 densification if enabled
                     if args.enable_depth_densify:
                         print(f"[*] Running Depth Anything V2 densification for {scene}...")
-                        depth_cmd = f"python depth_densify.py --scene_path {new_scene_dir} --model_path {args.depth_model_path} --stride {args.depth_stride}"
+                        depth_cmd = f"python depth_densify.py --scene_path {new_scene_dir} --model_path {args.depth_model_path} --stride {args.depth_stride} --voxel_size_ratio {args.depth_voxel_size_ratio} --radial_decay_sigma {args.depth_radial_decay_sigma} --radial_decay_min {args.depth_radial_decay_min} --depth_decay_coef {args.depth_decay_coef}"
                         
                         if args.dry_run:
                             print(f"[DRY-RUN] Would run: {depth_cmd}")

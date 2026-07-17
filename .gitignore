@@ -50,3 +50,5 @@ tools/**/.pytest_cache/
 build_3D/cache/
 build_3D/features/superpoint/assets/
 build_3D/matching/lightglue/assets/
+
+.DS_Store

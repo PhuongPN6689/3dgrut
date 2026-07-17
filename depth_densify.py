@@ -31,6 +31,10 @@ def parse_args():
     parser.add_argument("--min_depth", type=float, default=0.1, help="Minimum depth clip value (default: 0.1)")
     parser.add_argument("--max_depth", type=float, default=100.0, help="Maximum depth clip value (default: 100.0)")
     parser.add_argument("--max_images", type=int, default=-1, help="Maximum number of images to process for testing (-1 for all)")
+    parser.add_argument("--voxel_size_ratio", type=float, default=0.002, help="Voxel size ratio relative to scene scale std (default: 0.002, set <= 0 to disable)")
+    parser.add_argument("--radial_decay_sigma", type=float, default=0.6, help="Sigma for center-weighted Gaussian radial decay (default: 0.6, set <= 0 to disable)")
+    parser.add_argument("--radial_decay_min", type=float, default=0.2, help="Minimum baseline probability to keep points in the periphery (default: 0.2)")
+    parser.add_argument("--depth_decay_coef", type=float, default=1.5, help="Coefficient for depth-based exponential decay (default: 1.5, set <= 0 to disable)")
     return parser.parse_args()
 
 def extract_camera_intrinsics(camera):
@@ -233,8 +237,35 @@ def main():
         u_flat = u_mesh.flatten()
         v_flat = v_mesh.flatten()
         
+        # Calculate radial decay weights
+        if args.radial_decay_sigma > 0:
+            du = u_flat - cx
+            dv = v_flat - cy
+            r_sq = du**2 + dv**2
+            r_max_sq = (min(W, H) / 2.0) ** 2
+            
+            decay = np.exp(-r_sq / (2 * (args.radial_decay_sigma**2) * r_max_sq))
+            weights = args.radial_decay_min + (1.0 - args.radial_decay_min) * decay
+        else:
+            weights = np.ones(len(u_flat))
+            
+        # Get depth map values at these pixels
         depths = D_abs[v_flat, u_flat]
         colors = img_np[v_flat, u_flat]
+        
+        # Apply depth-based exponential decay if enabled (using median SIFT depth for scale)
+        if args.depth_decay_coef > 0:
+            median_sift_depth = np.median(pts_colmap_depth) if len(pts_colmap_depth) > 0 else 10.0
+            depth_weights = np.exp(-depths / (args.depth_decay_coef * median_sift_depth))
+            weights = weights * depth_weights
+            
+        # Stochastic selection
+        keep_mask = np.random.rand(len(u_flat)) < weights
+        
+        u_flat = u_flat[keep_mask]
+        v_flat = v_flat[keep_mask]
+        depths = depths[keep_mask]
+        colors = colors[keep_mask]
         
         # Compute camera space coordinates correcting for camera lens distortion
         pixel_coords = np.stack([u_flat, v_flat], axis=1).astype(np.float64)
@@ -260,11 +291,52 @@ def main():
             
     print(f"[+] Backprojected {len(new_points)} new dense points from Depth maps.")
     
-    # Merge original SIFT points with new dense points
-    final_points = original_points + new_points
-    final_colors = original_colors + new_colors
-    final_errors = original_errors + new_errors
-    
+    # 5. Apply Guided Voxel Filtering if enabled
+    if args.voxel_size_ratio > 0 and len(original_points) > 0:
+        pts_sift = np.array(original_points)
+        std_xyz = np.std(pts_sift, axis=0)
+        mean_std = np.mean(std_xyz)
+        voxel_size = mean_std * args.voxel_size_ratio
+        print(f"[+] Computed scene scale std: {mean_std:.4f}. Voxel size (ratio {args.voxel_size_ratio}): {voxel_size:.4f}")
+        
+        # Apply voxel filtering
+        unique_voxels = {}
+        # First pass: SIFT points (prioritized)
+        for i in range(len(original_points)):
+            pt = original_points[i]
+            key = tuple(np.floor(pt / voxel_size).astype(np.int32))
+            if key not in unique_voxels:
+                unique_voxels[key] = (True, pt, original_colors[i], original_errors[i])
+                
+        # Second pass: Depth Anything points (only if voxel is empty)
+        for i in range(len(new_points)):
+            pt = new_points[i]
+            key = tuple(np.floor(pt / voxel_size).astype(np.int32))
+            if key not in unique_voxels:
+                unique_voxels[key] = (False, pt, new_colors[i], new_errors[i])
+                
+        final_points = []
+        final_colors = []
+        final_errors = []
+        n_orig_kept = 0
+        n_new_kept = 0
+        
+        for is_orig, pt, col, err in unique_voxels.values():
+            final_points.append(pt)
+            final_colors.append(col)
+            final_errors.append(err)
+            if is_orig:
+                n_orig_kept += 1
+            else:
+                n_new_kept += 1
+                
+        print(f"[+] Guided Voxel Filtering: Kept {n_orig_kept}/{len(original_points)} original points and filled {n_new_kept}/{len(new_points)} new dense points.")
+    else:
+        # Merge original SIFT points with new dense points without filtering
+        final_points = original_points + new_points
+        final_colors = original_colors + new_colors
+        final_errors = original_errors + new_errors
+        
     print(f"[+] Total merged point cloud has {len(final_points)} points.")
     
     # Write to points3D.txt
