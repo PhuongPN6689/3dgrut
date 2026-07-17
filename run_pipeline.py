@@ -89,21 +89,38 @@ def parse_args():
     return args
 
 def setup_cuda_environment():
-    # Keep the CUDA dynamic linker paths matched in notebook
+    # Fix Kaggle/Docker JIT linker issue for libcuda
+    libcuda_paths = [
+        "/usr/local/nvidia/lib64/libcuda.so.1",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+        "/usr/lib64-nvidia/libcuda.so.1",
+    ]
+    libcuda_src = None
+    for p in libcuda_paths:
+        if os.path.exists(p):
+            libcuda_src = p
+            break
+
+    if libcuda_src:
+        libcuda_dst = "/tmp/libcuda.so"
+        if os.path.exists(libcuda_dst):
+            try:
+                os.remove(libcuda_dst)
+            except:
+                pass
+        try:
+            os.symlink(libcuda_src, libcuda_dst)
+            print(f"[+] Successfully created libcuda symlink: {libcuda_dst} -> {libcuda_src}")
+        except Exception as e:
+            print(f"[-] Warning: Failed to create libcuda symlink: {e}")
+            
+    # Add paths to environment
     cuda_lib = "/usr/local/nvidia/lib64"
-    if os.path.exists(cuda_lib):
-        os.environ["LD_LIBRARY_PATH"] = (
-            cuda_lib
-            + ":/usr/local/cuda/lib64"
-            + ":/usr/local/cuda/lib64/stubs:"
-            + os.environ.get("LD_LIBRARY_PATH", "")
-        )
-        os.environ["LIBRARY_PATH"] = (
-            cuda_lib
-            + ":/usr/local/cuda/lib64"
-            + ":/usr/local/cuda/lib64/stubs:"
-            + os.environ.get("LIBRARY_PATH", "")
-        )
+    paths_to_add = ["/tmp", cuda_lib, "/usr/local/cuda/lib64", "/usr/local/cuda/lib64/stubs"]
+    
+    ld_paths = [p for p in paths_to_add if os.path.exists(p) or p == "/tmp"]
+    os.environ["LD_LIBRARY_PATH"] = ":".join(ld_paths) + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LIBRARY_PATH"] = ":".join(ld_paths) + ":" + os.environ.get("LIBRARY_PATH", "")
 
 def main():
     args = parse_args()
